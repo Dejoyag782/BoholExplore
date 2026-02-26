@@ -11,21 +11,18 @@ import Map, {
 import "maplibre-gl/dist/maplibre-gl.css";
 import ModelLayer from "./partials/ModelLayer";
 import MapMarker from "./partials/MapMarker";
-import { ExtrusionLayer, getGtaGameStyle, GreeneryLayer, SeaLayer } from "../../utils/mapStyle";
+import { getGtaGameStyle } from "../../utils/mapStyle";
 
 const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const [mapRef, setMapRef] = useState<MapRef | null>(null);
   const [mapIsReady, setMapIsReady] = useState(false);
-  const [showDirections, setShowDirections] = useState(false);
-  const [routeGeoJSON, setRouteGeoJSON] = useState<any>(null);
   const [boholBounds, setBoholBounds] = useState<LngLatBoundsLike | null>(null);
   const [boholMask, setBoholMask] = useState<any>(null);
-  const [boholGeoJSON, setBoholGeoJSON] = useState<any>(null);
   const [boholOutlineGeoJSON, setBoholOutlineGeoJSON] = useState<any>(null);
   const [boholLakeFillGeoJSON, setBoholLakeFillGeoJSON] = useState<any>(null);
   const [rtsRouteGeoJSON, setRtsRouteGeoJSON] = useState<any>(null);
   const [providerPosition, setProviderPosition] = useState<{ lng: number; lat: number } | null>(null);
-  const [isMoving, setIsMoving] = useState(false);
+  const [, setIsMoving] = useState(false);
   const animationRef = useRef<number | null>(null);
   const providerCoordRef = useRef<[number, number] | null>(null);
   const providerHeadingRef = useRef<number | null>(null);
@@ -80,22 +77,6 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const providerCoord = parsedCoords.length === 2 ? to : from;
   const activeProvider = providerPosition ?? providerCoord ?? null;
 
-  const fetchRoute = async () => {
-    if (!from || !to) return;
-
-    const url = `https://router.project-osrm.org/route/v1/driving/${from.lng},${from.lat};${to.lng},${to.lat}?overview=full&geometries=geojson`;
-    const res = await fetch(url);
-    const data = await res.json();
-    setRouteGeoJSON({
-      type: "Feature",
-      geometry: data.routes[0].geometry,
-      properties: {
-        color: "#F7DC6F",
-        weight: 4,
-        opacity: 0.9,
-      },
-    });
-  };
 
   const haversineMeters = (a: [number, number], b: [number, number]) => {
     const toRad = (d: number) => (d * Math.PI) / 180;
@@ -317,14 +298,6 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     animateAlongRoute(geometry.coordinates as [number, number][]);
   };
 
-  useEffect(() => {
-    if (showDirections) {
-      fetchRoute();
-    } else {
-      setRouteGeoJSON(null);
-    }
-  }, [showDirections]);
-
   const initialView: ViewState = {
     padding: { top: 80, bottom: 80, left: 80, right: 80 },
     longitude: from?.lng ?? 0,
@@ -388,40 +361,6 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   };
 
   const rotateRef = useRef<number | null>(null);
-
-  const rotate = () => {
-    const map = mapRef?.getMap();
-    if (!map) return;
-
-    const bearing = (map.getBearing() + 0.1) % 360;
-    map.rotateTo(bearing, { duration: 0 });
-    rotateRef.current = requestAnimationFrame(rotate);
-  };
-
-  const handleLegendClick = (lat: number, lng: number) => {
-    const map = mapRef?.getMap();
-    if (!map) return;
-
-    if (rotateRef?.current) cancelAnimationFrame(rotateRef.current);
-
-    // Fly to the selected location
-    map.flyTo({
-      center: [lng, lat],
-      zoom: 18,
-      pitch: 60,
-      bearing: 0,
-      speed: 1.2,
-      curve: 1.4,
-      easing: (t) => t,
-      essential: true,
-    });
-
-    // Restart rotation once flying finishes
-    map.once("moveend", () => {
-      rotateRef.current = requestAnimationFrame(rotate);
-    });
-
-  };
 
   const handleMapRef = useCallback((ref: MapRef | null) => {
     if (!ref) return;
@@ -677,7 +616,6 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
 
         const feature = geoData?.features?.[0];
         if (feature?.geometry) {
-          setBoholGeoJSON(geoData);
           setBoholOutlineGeoJSON(buildOutlineFromBohol(feature));
           setBoholLakeFillGeoJSON(buildLakeFillFromBohol(feature.geometry));
           setBoholMask(buildMaskFromBohol(feature.geometry));
@@ -933,20 +871,6 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
               </Fragment>
             );
           })}
-
-          {routeGeoJSON && (
-            <Source id="route" type="geojson" data={routeGeoJSON}>
-              <Layer
-                id="route-line"
-                type="line"
-                paint={{
-                  "line-color": "#1D4ED8",
-                  "line-width": 4,
-                  "line-opacity": 0.9,
-                }}
-              />
-            </Source>
-          )}
 
           {rtsRouteGeoJSON && (
             <Source id="rts-route" type="geojson" data={rtsRouteGeoJSON}>
