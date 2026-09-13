@@ -18,6 +18,13 @@ export type TankPlayer = {
   deaths: number;
   cooldown: number;
   respawnIn: number;
+  airborne: boolean;
+  altitude: number | null;
+  groundAltitude: number | null;
+  airtime: number;
+  verticalVelocity: number;
+  airborneSpeed: number;
+  terrainSlope: number;
   shotSequence: number;
   lastShot: {
     from: [number, number];
@@ -27,12 +34,21 @@ export type TankPlayer = {
 
 export const IDLE_TANK_INPUT: TankInput = { forward: 0, turn: 0, firing: false };
 export const TANK_MAX_HP = 100;
-export const TANK_SPEED_METERS = 24;
-export const TANK_TURN_SPEED = 1.65;
+export const TANK_SPEED_METERS = 60;
+export const TANK_TURN_SPEED = 1.8;
 export const TANK_FIRE_RANGE_METERS = 180;
-export const TANK_FIRE_COOLDOWN = 0.7;
+export const TANK_FIRE_COOLDOWN = 1;
+export const TANK_SPAWN_RADIUS_METERS = 100;
 export const TANK_DAMAGE = 34;
 export const TANK_RESPAWN_SECONDS = 3;
+export const TANK_GRAVITY = 22;
+export const TANK_TERRAIN_LOOKAHEAD_METERS = 8;
+export const TANK_RAMP_TAKEOFF_SLOPE = 0.08;
+export const TANK_DROP_TAKEOFF_SLOPE = -0.15;
+export const TANK_MAX_AIRTIME_SECONDS = 2;
+export const TANK_MAX_AIR_HEIGHT_METERS = 3;
+
+export type TankTerrainElevation = (position: [number, number]) => number | null | undefined;
 
 const PLAYER_COLORS = ["#22d3ee", "#fb7185", "#fbbf24", "#a78bfa", "#4ade80", "#f97316"];
 const normalizeAngle = (angle: number) => Math.atan2(Math.sin(angle), Math.cos(angle));
@@ -43,8 +59,13 @@ export const createTankPlayer = (
   origin: [number, number],
   index: number
 ): TankPlayer => {
-  const angle = (index * Math.PI * 2) / 6;
-  const position = offsetMeters(origin, Math.cos(angle) * 75, Math.sin(angle) * 75);
+  const angle = Math.random() * Math.PI * 2;
+  const distance = Math.sqrt(Math.random()) * TANK_SPAWN_RADIUS_METERS;
+  const position = offsetMeters(
+    origin,
+    Math.cos(angle) * distance,
+    Math.sin(angle) * distance
+  );
   return {
     id,
     name: name.trim().slice(0, 18) || `Tank ${index + 1}`,
@@ -57,6 +78,13 @@ export const createTankPlayer = (
     deaths: 0,
     cooldown: 0,
     respawnIn: 0,
+    airborne: false,
+    altitude: null,
+    groundAltitude: null,
+    airtime: 0,
+    verticalVelocity: 0,
+    airborneSpeed: 0,
+    terrainSlope: 0,
     shotSequence: 0,
     lastShot: null,
   };
@@ -83,26 +111,120 @@ const targetInSight = (shooter: TankPlayer, candidates: TankPlayer[]) => {
 export const stepTankBattle = (
   sourcePlayers: TankPlayer[],
   inputs: ReadonlyMap<string, TankInput>,
-  deltaSeconds: number
+  deltaSeconds: number,
+  terrainElevation?: TankTerrainElevation
 ) => {
   const delta = Math.max(0, Math.min(deltaSeconds, 0.05));
   const moved = sourcePlayers.map((player) => {
     if (player.hp <= 0) {
       const respawnIn = Math.max(0, player.respawnIn - delta);
       return respawnIn === 0
-        ? { ...player, position: player.spawnPosition, hp: TANK_MAX_HP, respawnIn: 0 }
+        ? {
+            ...player,
+            position: player.spawnPosition,
+            hp: TANK_MAX_HP,
+            respawnIn: 0,
+            airborne: false,
+            altitude: null,
+            groundAltitude: null,
+            airtime: 0,
+            verticalVelocity: 0,
+            airborneSpeed: 0,
+            terrainSlope: 0,
+          }
         : { ...player, respawnIn };
     }
 
     const input = inputs.get(player.id) ?? IDLE_TANK_INPUT;
     const heading = normalizeAngle(player.heading + input.turn * TANK_TURN_SPEED * delta);
-    const travel = input.forward * TANK_SPEED_METERS * delta;
+    const inputSpeed = input.forward * TANK_SPEED_METERS;
+    const travelSpeed = player.airborne ? player.airborneSpeed : inputSpeed;
+    const travel = travelSpeed * delta;
     const position = offsetMeters(
       player.position,
       Math.cos(heading) * travel,
       Math.sin(heading) * travel
     );
-    return { ...player, heading, position, cooldown: Math.max(0, player.cooldown - delta) };
+    let airborne = player.airborne;
+    let altitude = player.altitude;
+    let groundAltitude = player.groundAltitude;
+    let airtime = player.airtime;
+    let verticalVelocity = player.verticalVelocity;
+    let airborneSpeed = player.airborneSpeed;
+    let terrainSlope = player.terrainSlope;
+
+    if (terrainElevation && travelSpeed !== 0) {
+      const terrainHere = terrainElevation(position);
+      if (terrainHere != null) groundAltitude = terrainHere;
+      const lookahead = offsetMeters(
+        position,
+        Math.cos(heading) * input.forward * TANK_TERRAIN_LOOKAHEAD_METERS,
+        Math.sin(heading) * input.forward * TANK_TERRAIN_LOOKAHEAD_METERS
+      );
+      const terrainAhead = terrainElevation(lookahead);
+      if (terrainHere != null && terrainAhead != null) {
+        const slope = Math.max(
+          -2,
+          Math.min(2, (terrainAhead - terrainHere) / TANK_TERRAIN_LOOKAHEAD_METERS)
+        );
+        const leftRampCrest =
+          terrainSlope > TANK_RAMP_TAKEOFF_SLOPE && slope < terrainSlope - 0.04;
+        const reachedDrop =
+          slope < TANK_DROP_TAKEOFF_SLOPE && terrainSlope >= TANK_DROP_TAKEOFF_SLOPE;
+        if (!airborne && input.forward > 0 && (leftRampCrest || reachedDrop)) {
+          airborne = true;
+          airborneSpeed = travelSpeed;
+          altitude = terrainHere;
+          airtime = 0;
+          verticalVelocity = Math.max(
+            3,
+            Math.min(18, Math.abs(travelSpeed) * Math.max(terrainSlope, 0.1) * 0.75)
+          );
+        }
+        terrainSlope = slope;
+      }
+    }
+
+    if (airborne && terrainElevation) {
+      const sampledGroundAltitude = terrainElevation(position);
+      if (sampledGroundAltitude != null) groundAltitude = sampledGroundAltitude;
+      const safeGroundAltitude = groundAltitude ?? altitude ?? 0;
+      const unconstrainedAltitude =
+        (altitude ?? safeGroundAltitude) + verticalVelocity * delta;
+      const nextAltitude = Math.min(
+        unconstrainedAltitude,
+        safeGroundAltitude + TANK_MAX_AIR_HEIGHT_METERS
+      );
+      if (unconstrainedAltitude > nextAltitude) verticalVelocity = Math.min(0, verticalVelocity);
+      verticalVelocity -= TANK_GRAVITY * delta;
+      airtime += delta;
+      if (
+        (nextAltitude <= safeGroundAltitude && verticalVelocity <= 0) ||
+        airtime >= TANK_MAX_AIRTIME_SECONDS
+      ) {
+        airborne = false;
+        altitude = null;
+        airtime = 0;
+        verticalVelocity = 0;
+        airborneSpeed = 0;
+      } else {
+        altitude = nextAltitude;
+      }
+    }
+
+    return {
+      ...player,
+      heading,
+      position,
+      cooldown: Math.max(0, player.cooldown - delta),
+      airborne,
+      altitude,
+      groundAltitude,
+      airtime,
+      verticalVelocity,
+      airborneSpeed,
+      terrainSlope,
+    };
   });
 
   const damage = new Map<string, { amount: number; attackerId: string }>();

@@ -27,6 +27,7 @@ import {
   getMatchResult,
   issueAttackCommand,
   issueMoveCommand,
+  offsetMeters,
   selectUnitIdsInScreenBox,
   stepRtsSimulation,
   type GameMode,
@@ -34,7 +35,10 @@ import {
   type UnitState,
 } from "../../game/rts";
 import { getRtsAudioFrame } from "../../game/rtsAudio";
-import type { TankInput } from "../../game/tankPvp";
+import {
+  TANK_SPAWN_RADIUS_METERS,
+  type TankInput,
+} from "../../game/tankPvp";
 
 const BASE_MODEL_ELEVATION = 7;
 const MANUAL_SPEED_FACTOR = 0.12;
@@ -49,7 +53,25 @@ const FOLLOW_ZOOM = 18.5;
 const MAX_FOLLOW_DRIFT_METERS = 180;
 const TANK_FOLLOW_ZOOM = 18.4;
 const TANK_CAMERA_PITCH = 58;
-const TANK_CAMERA_LOOK_AHEAD_METERS = 18;
+
+const createSpawnAreaFeature = (center: [number, number]) => {
+  const ring = Array.from({ length: 65 }, (_, index) => {
+    const angle = (index / 64) * Math.PI * 2;
+    return offsetMeters(
+      center,
+      Math.cos(angle) * TANK_SPAWN_RADIUS_METERS,
+      Math.sin(angle) * TANK_SPAWN_RADIUS_METERS
+    );
+  });
+  return {
+    type: "Feature" as const,
+    properties: {},
+    geometry: {
+      type: "Polygon" as const,
+      coordinates: [ring],
+    },
+  };
+};
 
 type EngineAudioGraph = {
   context: AudioContext;
@@ -105,6 +127,9 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     end: { x: number; y: number };
   } | null>(null);
   const [providerPosition, setProviderPosition] = useState<{ lng: number; lat: number } | null>(null);
+  const [pvpSpawnCenter, setPvpSpawnCenter] = useState<[number, number] | null>(null);
+  const [pvpSpawnPreview, setPvpSpawnPreview] = useState<[number, number] | null>(null);
+  const [isSelectingPvpSpawn, setIsSelectingPvpSpawn] = useState(false);
   const [, setIsMoving] = useState(false);
   const animationRef = useRef<number | null>(null);
   const providerCoordRef = useRef<[number, number] | null>(null);
@@ -119,6 +144,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const airborneSpeedRef = useRef(0);
   const terrainSlopeRef = useRef(0);
   const engineAudioRef = useRef<EngineAudioGraph | null>(null);
+  const tankShotSequenceRef = useRef<{ playerId: string; sequence: number } | null>(null);
   const rtsAudioRef = useRef<RtsAudioGraph | null>(null);
   const rtsUnitsRef = useRef<UnitState[]>([]);
   const selectedUnitIdsRef = useRef<Set<string>>(new Set());
@@ -138,8 +164,6 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const orbitAnimationRef = useRef<number | null>(null);
   const cameraCenterRef = useRef<[number, number] | null>(null);
   const cameraBearingRef = useRef<number | null>(null);
-  const tankCameraCenterRef = useRef<[number, number] | null>(null);
-  const tankCameraBearingRef = useRef<number | null>(null);
   const animationDataRef = useRef({
     progress: 0,
     totalDistance: 0,
@@ -177,14 +201,25 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const providerCoord = parsedCoords.length === 2 ? to : from;
   const activeProvider = providerPosition ?? providerCoord ?? null;
   const pvpOrigin = useMemo<[number, number]>(
-    () => activeProvider ? [activeProvider.lng, activeProvider.lat] : [123.9, 9.8],
-    [activeProvider]
+    () => pvpSpawnCenter ?? (activeProvider ? [activeProvider.lng, activeProvider.lat] : [123.9, 9.8]),
+    [activeProvider, pvpSpawnCenter]
   );
-  const tankParty = useTankParty(gameMode === "pvp", pvpOrigin);
+  const pvpSpawnAreaGeoJSON = useMemo(
+    () => createSpawnAreaFeature(pvpSpawnPreview ?? pvpSpawnCenter ?? pvpOrigin),
+    [pvpOrigin, pvpSpawnCenter, pvpSpawnPreview]
+  );
+  const getPvpTerrainElevation = useCallback(
+    (position: [number, number]) =>
+      mapRef?.getMap()?.queryTerrainElevation(position) ?? null,
+    [mapRef]
+  );
+  const tankParty = useTankParty(
+    gameMode === "pvp",
+    pvpOrigin,
+    getPvpTerrainElevation
+  );
   const setTankInput = tankParty.setInput;
   const tankPartyStatus = tankParty.status;
-  const tankPlayersRef = useRef(tankParty.players);
-  tankPlayersRef.current = tankParty.players;
 
   const startEngineAudio = useCallback(() => {
     const existing = engineAudioRef.current;
@@ -325,6 +360,26 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     blast.stop(now + 0.34);
     crack.start(now);
   }, [startEngineAudio]);
+
+  useEffect(() => {
+    const localPlayer = tankParty.players.find((player) => player.id === tankParty.localPeerId);
+    if (!localPlayer) {
+      tankShotSequenceRef.current = null;
+      return;
+    }
+
+    const previous = tankShotSequenceRef.current;
+    tankShotSequenceRef.current = {
+      playerId: localPlayer.id,
+      sequence: localPlayer.shotSequence,
+    };
+    if (
+      previous?.playerId === localPlayer.id &&
+      localPlayer.shotSequence > previous.sequence
+    ) {
+      playTankShotAudio();
+    }
+  }, [playTankShotAudio, tankParty.localPeerId, tankParty.players]);
 
   const handleTankTouchInput = useCallback((input: TankInput) => {
     setTankInput(input);
@@ -477,6 +532,8 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   }, [activeProvider, commitUnitSelection, mapRef, playRtsEffect]);
 
   const openModeMenu = useCallback(() => {
+    setIsSelectingPvpSpawn(false);
+    setPvpSpawnPreview(null);
     setIsModeMenuOpen(true);
     pressedKeysRef.current.clear();
     updateEngineAudio(0, false);
@@ -504,8 +561,6 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
       map.easeTo({ center, zoom: Math.max(15, map.getZoom()), pitch: 55, bearing: 0, duration: 600 });
     }
     if (mode === "pvp" && map) {
-      tankCameraCenterRef.current = null;
-      tankCameraBearingRef.current = null;
       map.easeTo({
         center: pvpOrigin,
         zoom: TANK_FOLLOW_ZOOM,
@@ -791,6 +846,24 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     setCheckpoints((current) => [...current, [lng, lat]]);
   };
 
+  const beginPvpSpawnSelection = useCallback(() => {
+    setPvpSpawnPreview(pvpSpawnCenter ?? pvpOrigin);
+    setIsSelectingPvpSpawn(true);
+  }, [pvpOrigin, pvpSpawnCenter]);
+
+  const cancelPvpSpawnSelection = useCallback(() => {
+    setIsSelectingPvpSpawn(false);
+    setPvpSpawnPreview(null);
+  }, []);
+
+  const handlePvpSpawnClick = (event: MapLayerMouseEvent) => {
+    if (!isSelectingPvpSpawn) return;
+    const center: [number, number] = [event.lngLat.lng, event.lngLat.lat];
+    setPvpSpawnCenter(center);
+    setPvpSpawnPreview(null);
+    setIsSelectingPvpSpawn(false);
+  };
+
   const playCheckpointRoute = async () => {
     if (!activeProvider || checkpoints.length === 0 || isRouteLoading) return;
 
@@ -921,7 +994,12 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
 
   const handleMapMouseMove = (event: MapLayerMouseEvent) => {
     const map = mapRef?.getMap();
-    if (!map || gameMode !== "command" || isModeMenuOpen) return;
+    if (!map) return;
+    if (gameMode === "pvp" && isSelectingPvpSpawn) {
+      setPvpSpawnPreview([event.lngLat.lng, event.lngLat.lat]);
+      return;
+    }
+    if (gameMode !== "command" || isModeMenuOpen) return;
     if (middlePanRef.current) {
       const previous = middlePanRef.current;
       map.panBy([previous.x - event.point.x, previous.y - event.point.y], { animate: false });
@@ -1475,7 +1553,6 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
       if (!["KeyW", "KeyA", "KeyS", "KeyD", "Space"].includes(event.code)) return;
       event.preventDefault();
       startEngineAudio();
-      if (event.code === "Space" && !event.repeat) playTankShotAudio();
       keys.add(event.code);
       publishInput();
     };
@@ -1498,33 +1575,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
       setTankInput({ forward: 0, turn: 0, firing: false });
       updateEngineAudio(0, false);
     };
-  }, [gameMode, isModeMenuOpen, playTankShotAudio, setTankInput, startEngineAudio, tankPartyStatus, updateEngineAudio]);
-
-  useEffect(() => {
-    if (gameMode !== "pvp" || isModeMenuOpen || !tankParty.localPeerId) return;
-    const localTank = tankParty.players.find((player) => player.id === tankParty.localPeerId);
-    const map = mapRef?.getMap();
-    if (!localTank || !map) return;
-    const targetCenter = offsetCoordinate(
-      localTank.position,
-      localTank.heading,
-      TANK_CAMERA_LOOK_AHEAD_METERS
-    );
-    const center = smoothCoord(tankCameraCenterRef.current, targetCenter, 0.38);
-    const targetBearing = normalizeDegrees(90 - (localTank.heading * 180) / Math.PI);
-    const bearing = tankCameraBearingRef.current == null
-      ? targetBearing
-      : smoothDegrees(tankCameraBearingRef.current, targetBearing, 0.42);
-    tankCameraCenterRef.current = center;
-    tankCameraBearingRef.current = bearing;
-    map.setCenterClampedToGround(true);
-    map.jumpTo({
-      center,
-      zoom: TANK_FOLLOW_ZOOM,
-      pitch: TANK_CAMERA_PITCH,
-      bearing,
-    });
-  }, [gameMode, isModeMenuOpen, mapRef, tankParty.localPeerId, tankParty.players]);
+  }, [gameMode, isModeMenuOpen, setTankInput, startEngineAudio, tankPartyStatus, updateEngineAudio]);
 
   const startRouteZip = (path: [number, number][]) => {
     if (zipAnimationRef.current) {
@@ -1964,7 +2015,13 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
             players={tankParty.players}
             error={tankParty.error}
             isHost={tankParty.isHost}
-            onHost={(name) => void tankParty.createParty(name)}
+            spawnAreaSelected={pvpSpawnCenter !== null}
+            isSelectingSpawnArea={isSelectingPvpSpawn}
+            onHost={(name) => {
+              if (pvpSpawnCenter) void tankParty.createParty(name);
+            }}
+            onBeginSpawnSelection={beginPvpSpawnSelection}
+            onCancelSpawnSelection={cancelPvpSpawnSelection}
             onJoin={(code, name) => void tankParty.joinParty(code, name)}
             onLeave={() => {
               tankParty.leaveParty();
@@ -1972,7 +2029,6 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
             }}
             onChangeMode={openModeMenu}
             onInputChange={handleTankTouchInput}
-            onFireStart={playTankShotAudio}
           />
         )}
         {selectionBox && gameMode === "command" && !isModeMenuOpen && (
@@ -1996,17 +2052,25 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
           onDragStart={() => { userInteractedRef.current = true; }}
           onZoomStart={() => { userInteractedRef.current = true; }}
           onRotateStart={() => { userInteractedRef.current = true; }}
-          onClick={gameMode === "roam" && !isModeMenuOpen ? handleMapClick : undefined}
+          onClick={isSelectingPvpSpawn
+            ? handlePvpSpawnClick
+            : gameMode === "roam" && !isModeMenuOpen
+              ? handleMapClick
+              : undefined}
           initialViewState={initialView}
           maxBounds={boholBounds ?? undefined}
           minZoom={13}
           maxZoom={20}
           maxPitch={85}
-          dragPan={gameMode === "roam"}
+          dragPan={gameMode === "roam" || isSelectingPvpSpawn}
           renderWorldCopies={false}
           mapStyle={mapStyle as any}
           mapLib={import("maplibre-gl")}
-          style={{ width: "100%", height: "100%" }}
+          style={{
+            width: "100%",
+            height: "100%",
+            cursor: isSelectingPvpSpawn ? "crosshair" : undefined,
+          }}
         >
           <NavigationControl position="bottom-right" />
           {/* <FullscreenControl position="top-right" /> */}
@@ -2144,6 +2208,42 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
             </Source>
           )}
 
+          {mapIsReady && gameMode === "pvp" && !isModeMenuOpen &&
+            (isSelectingPvpSpawn || pvpSpawnCenter) &&
+            tankParty.status !== "hosting" && tankParty.status !== "joined" && (
+              <Source id="tank-pvp-spawn-area" type="geojson" data={pvpSpawnAreaGeoJSON}>
+                <Layer
+                  id="tank-pvp-spawn-area-fill"
+                  type="fill"
+                  paint={{
+                    "fill-color": "#fbbf24",
+                    "fill-opacity": 0.2,
+                  }}
+                />
+                <Layer
+                  id="tank-pvp-spawn-area-outline"
+                  type="line"
+                  paint={{
+                    "line-color": "#fde68a",
+                    "line-width": 3,
+                    "line-dasharray": [2, 1.5],
+                  }}
+                />
+              </Source>
+            )}
+
+          {mapIsReady && gameMode === "pvp" && !isModeMenuOpen && isSelectingPvpSpawn && (
+            <Marker
+              longitude={(pvpSpawnPreview ?? pvpOrigin)[0]}
+              latitude={(pvpSpawnPreview ?? pvpOrigin)[1]}
+              anchor="center"
+            >
+              <div className="pointer-events-none grid h-8 w-8 place-items-center rounded-full border-2 border-amber-100 bg-amber-300/30 shadow-[0_0_20px_rgba(251,191,36,0.8)]">
+                <span className="h-1.5 w-1.5 rounded-full bg-white" />
+              </div>
+            </Marker>
+          )}
+
           <RtsBattleLayer
             map={mapRef?.getMap()}
             unitsRef={rtsUnitsRef}
@@ -2153,7 +2253,8 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
 
           <TankPvpLayer
             map={mapRef?.getMap()}
-            playersRef={tankPlayersRef}
+            playersRef={tankParty.playersRef}
+            localPeerId={tankParty.localPeerId}
             visible={mapIsReady && gameMode === "pvp" && !isModeMenuOpen && tankParty.players.length > 0}
           />
 

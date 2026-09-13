@@ -6,9 +6,11 @@ import {
   stepTankBattle,
   type TankInput,
   type TankPlayer,
+  type TankTerrainElevation,
 } from "../game/tankPvp";
+import { ensureTankModelCached } from "../game/tankModelCache";
 
-type PartyStatus = "idle" | "connecting" | "hosting" | "joined" | "error";
+type PartyStatus = "idle" | "downloading" | "connecting" | "hosting" | "joined" | "error";
 type ClientMessage =
   | { type: "join"; name: string }
   | { type: "input"; input: TankInput };
@@ -18,6 +20,7 @@ const PARTY_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const PARTY_CODE_LENGTH = 6;
 const PARTY_PEER_PREFIX = "bt3d-";
 const PARTY_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{6}$/;
+const TANK_SNAPSHOT_INTERVAL_MS = 33;
 
 export const createTankPartyCode = () => {
   const randomBytes = crypto.getRandomValues(new Uint8Array(PARTY_CODE_LENGTH));
@@ -78,7 +81,11 @@ const hostMessage = (value: unknown): HostMessage | null => {
     : null;
 };
 
-export const useTankParty = (active: boolean, origin: [number, number]) => {
+export const useTankParty = (
+  active: boolean,
+  origin: [number, number],
+  terrainElevation?: TankTerrainElevation
+) => {
   const [status, setStatus] = useState<PartyStatus>("idle");
   const [partyCode, setPartyCode] = useState("");
   const [localPeerId, setLocalPeerId] = useState<string | null>(null);
@@ -91,8 +98,11 @@ export const useTankParty = (active: boolean, origin: [number, number]) => {
   const playersRef = useRef<TankPlayer[]>([]);
   const inputsRef = useRef<Map<string, TankInput>>(new Map());
   const localInputRef = useRef<TankInput>(IDLE_TANK_INPUT);
+  const operationRef = useRef(0);
   const originRef = useRef(origin);
+  const terrainElevationRef = useRef(terrainElevation);
   originRef.current = origin;
+  terrainElevationRef.current = terrainElevation;
 
   const publishPlayers = useCallback((next: TankPlayer[]) => {
     playersRef.current = next;
@@ -104,6 +114,7 @@ export const useTankParty = (active: boolean, origin: [number, number]) => {
   }, []);
 
   const leaveParty = useCallback(() => {
+    operationRef.current += 1;
     hostConnectionRef.current?.close();
     connectionsRef.current.forEach((connection) => connection.close());
     connectionsRef.current.clear();
@@ -122,13 +133,22 @@ export const useTankParty = (active: boolean, origin: [number, number]) => {
 
   const createParty = useCallback(async (name: string) => {
     leaveParty();
-    setStatus("connecting");
+    const operation = operationRef.current;
+    setStatus("downloading");
     try {
+      await ensureTankModelCached();
+      if (operationRef.current !== operation) return;
+      setStatus("connecting");
       const { Peer: PeerClient } = await import("peerjs");
+      if (operationRef.current !== operation) return;
       const partyCode = createTankPartyCode();
       const peer = new PeerClient(partyPeerIdFromCode(partyCode));
       peerRef.current = peer;
       peer.on("open", (id) => {
+        if (operationRef.current !== operation) {
+          peer.destroy();
+          return;
+        }
         const host = createTankPlayer(id, name, originRef.current, 0);
         setLocalPeerId(id);
         setPartyCode(partyCode);
@@ -164,10 +184,12 @@ export const useTankParty = (active: boolean, origin: [number, number]) => {
         });
       });
       peer.on("error", (peerError) => {
+        if (operationRef.current !== operation) return;
         setError(peerError.message || "Could not create party");
         setStatus("error");
       });
     } catch (cause) {
+      if (operationRef.current !== operation) return;
       setError(cause instanceof Error ? cause.message : "PeerJS failed to load");
       setStatus("error");
     }
@@ -177,17 +199,27 @@ export const useTankParty = (active: boolean, origin: [number, number]) => {
     const hostId = partyPeerIdFromCode(code);
     if (!hostId) return;
     leaveParty();
+    const operation = operationRef.current;
     setPartyCode(displayCodeFromPeerId(hostId));
-    setStatus("connecting");
+    setStatus("downloading");
     try {
+      await ensureTankModelCached();
+      if (operationRef.current !== operation) return;
+      setStatus("connecting");
       const { Peer: PeerClient } = await import("peerjs");
+      if (operationRef.current !== operation) return;
       const peer = new PeerClient();
       peerRef.current = peer;
       peer.on("open", (id) => {
+        if (operationRef.current !== operation) {
+          peer.destroy();
+          return;
+        }
         setLocalPeerId(id);
         const connection = peer.connect(hostId, { reliable: true });
         hostConnectionRef.current = connection;
         connection.on("open", () => {
+          if (operationRef.current !== operation) return;
           connection.send({ type: "join", name } satisfies ClientMessage);
           setStatus("joined");
         });
@@ -208,10 +240,12 @@ export const useTankParty = (active: boolean, origin: [number, number]) => {
         });
       });
       peer.on("error", (peerError) => {
+        if (operationRef.current !== operation) return;
         setError(peerError.message || "Could not connect to party");
         setStatus("error");
       });
     } catch (cause) {
+      if (operationRef.current !== operation) return;
       setError(cause instanceof Error ? cause.message : "PeerJS failed to load");
       setStatus("error");
     }
@@ -240,11 +274,12 @@ export const useTankParty = (active: boolean, origin: [number, number]) => {
       const next = stepTankBattle(
         playersRef.current,
         inputsRef.current,
-        (now - previous) / 1000
+        (now - previous) / 1000,
+        terrainElevationRef.current
       );
       previous = now;
       playersRef.current = next;
-      if (now - lastBroadcast >= 50) {
+      if (now - lastBroadcast >= TANK_SNAPSHOT_INTERVAL_MS) {
         publishPlayers(next);
         lastBroadcast = now;
       }
@@ -259,6 +294,7 @@ export const useTankParty = (active: boolean, origin: [number, number]) => {
     partyCode,
     localPeerId,
     players,
+    playersRef,
     error,
     isHost,
     createParty,

@@ -5,6 +5,7 @@ import {
   IDLE_TANK_INPUT,
   stepTankBattle,
   TANK_MAX_HP,
+  TANK_SPEED_METERS,
   type TankInput,
 } from "./tankPvp";
 
@@ -62,5 +63,32 @@ describe("tank PvP simulation", () => {
       0.05
     )[0];
     expect(next.position).not.toEqual(player.position);
+  });
+
+  it("uses roam-style takeoff and preserves momentum during airtime", () => {
+    const player = {
+      ...createTankPlayer("host", "Host", origin, 0),
+      position: origin,
+      heading: 0,
+      terrainSlope: 0.2,
+    };
+    const terrainElevation = () => 10;
+    const launched = stepTankBattle(
+      [player],
+      new Map([[player.id, { forward: 1, turn: 0, firing: false }]]),
+      0.05,
+      terrainElevation
+    )[0];
+
+    expect(launched.airborne).toBe(true);
+    expect(launched.airborneSpeed).toBe(TANK_SPEED_METERS);
+
+    const coasting = stepTankBattle(
+      [launched],
+      new Map([[player.id, IDLE_TANK_INPUT]]),
+      0.05,
+      terrainElevation
+    )[0];
+    expect(coasting.position).not.toEqual(launched.position);
   });
 });

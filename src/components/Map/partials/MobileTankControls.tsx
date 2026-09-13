@@ -4,13 +4,12 @@ import type { TankInput } from "../../../game/tankPvp";
 
 interface MobileTankControlsProps {
   onInputChange: (input: TankInput) => void;
-  onFireStart: () => void;
 }
 
 const STICK_TRAVEL = 42;
 const DEAD_ZONE = 0.12;
 
-const MobileTankControls = ({ onInputChange, onFireStart }: MobileTankControlsProps) => {
+const MobileTankControls = ({ onInputChange }: MobileTankControlsProps) => {
   const joystickRef = useRef<HTMLDivElement>(null);
   const joystickPointerRef = useRef<number | null>(null);
   const firePointerRef = useRef<number | null>(null);
@@ -84,7 +83,6 @@ const MobileTankControls = ({ onInputChange, onFireStart }: MobileTankControlsPr
     event.currentTarget.setPointerCapture(event.pointerId);
     setIsFiring(true);
     publishInput({ firing: true });
-    onFireStart();
   };
 
   const handleFireEnd = (event: ReactPointerEvent<HTMLButtonElement>) => {
