@@ -19,6 +19,7 @@ import RtsBattleLayer from "./partials/RtsBattleLayer";
 import RtsHud from "./partials/RtsHud";
 import TankPvpHud from "./partials/TankPvpHud";
 import TankPvpLayer from "./partials/TankPvpLayer";
+import MobileRoamControls, { type RoamInput } from "./partials/MobileRoamControls";
 import GameModeMenu from "../GameModeMenu";
 import { useTankParty } from "../../hooks/useTankParty";
 import { getGtaGameStyle } from "../../utils/mapStyle";
@@ -139,6 +140,8 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const modelAltitudeOverrideRef = useRef<number | null>(null);
   const manualAnimationRef = useRef<number | null>(null);
   const pressedKeysRef = useRef<Set<string>>(new Set());
+  const roamTouchInputRef = useRef<RoamInput>({ forward: 0, turn: 0 });
+  const startRoamAnimationRef = useRef<(() => void) | null>(null);
   const airborneRef = useRef(false);
   const verticalVelocityRef = useRef(0);
   const airborneSpeedRef = useRef(0);
@@ -160,6 +163,9 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
   const lastCoordsKeyRef = useRef<string | null>(null);
   const [cameraMode, setCameraMode] = useState<"follow" | "orbit" | "free">("free");
+  const [isRoamHudCollapsed, setIsRoamHudCollapsed] = useState(
+    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches
+  );
   const orbitBearingRef = useRef(0);
   const orbitAnimationRef = useRef<number | null>(null);
   const cameraCenterRef = useRef<[number, number] | null>(null);
@@ -391,6 +397,23 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
       input.forward !== 0 || input.turn !== 0
     );
   }, [setTankInput, startEngineAudio, updateEngineAudio]);
+
+  const handleRoamTouchInput = useCallback((input: RoamInput) => {
+    roamTouchInputRef.current = input;
+    const isActive = input.forward !== 0 || input.turn !== 0;
+    if (!isActive) return;
+
+    startEngineAudio();
+    if (animationRef.current) {
+      cancelAnimationFrame(animationRef.current);
+      animationRef.current = null;
+    }
+    if (zipAnimationRef.current) {
+      cancelAnimationFrame(zipAnimationRef.current);
+      zipAnimationRef.current = null;
+    }
+    startRoamAnimationRef.current?.();
+  }, [startEngineAudio]);
 
   const startRtsAudio = useCallback(() => {
     const existing = rtsAudioRef.current;
@@ -1191,8 +1214,17 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
 
       const keys = pressedKeysRef.current;
       const position = providerCoordRef.current;
-      const forward = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0);
-      const steering = (keys.has("KeyA") ? 1 : 0) - (keys.has("KeyD") ? 1 : 0);
+      const touchInput = roamTouchInputRef.current;
+      const forward = clamp(
+        (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0) + touchInput.forward,
+        -1,
+        1
+      );
+      const steering = clamp(
+        (keys.has("KeyA") ? 1 : 0) - (keys.has("KeyD") ? 1 : 0) + touchInput.turn,
+        -1,
+        1
+      );
       const inputSpeed = forward * speedRef.current * MANUAL_SPEED_FACTOR;
       const travelSpeed = airborneRef.current ? airborneSpeedRef.current : inputSpeed;
 
@@ -1298,13 +1330,13 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
 
       updateEngineAudio(
         Math.abs(travelSpeed) / (500 * MANUAL_SPEED_FACTOR),
-        keys.size > 0 || airborneRef.current,
+        forward !== 0 || steering !== 0 || airborneRef.current,
         airborneRef.current
       );
 
       map.triggerRepaint();
 
-      if (keys.size > 0 || airborneRef.current) {
+      if (forward !== 0 || steering !== 0 || airborneRef.current) {
         manualAnimationRef.current = requestAnimationFrame(tick);
       } else {
         manualAnimationRef.current = null;
@@ -1319,6 +1351,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
       setIsMoving(true);
       manualAnimationRef.current = requestAnimationFrame(tick);
     };
+    startRoamAnimationRef.current = startManualAnimation;
 
     const isEditableTarget = (target: EventTarget | null) =>
       target instanceof HTMLElement &&
@@ -1354,6 +1387,8 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
 
     const onBlur = () => {
       pressedKeysRef.current.clear();
+      roamTouchInputRef.current = { forward: 0, turn: 0 };
+      startRoamAnimationRef.current = null;
       updateEngineAudio(0, false);
     };
 
@@ -1849,7 +1884,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
 
       <div className="w-full h-[100vh] overflow-hidden relative">
         {gameMode === "roam" && !isModeMenuOpen && (
-        <aside className="absolute left-3 top-3 z-10 w-[min(19rem,calc(100vw-1.5rem))] select-none text-xs text-slate-100 sm:left-5 sm:top-5">
+        <aside className={`absolute left-3 top-3 z-10 select-none text-xs text-slate-100 sm:left-5 sm:top-5 ${isRoamHudCollapsed ? "w-auto" : "w-[min(19rem,calc(100vw-1.5rem))]"}`}>
           <div className="relative overflow-hidden border border-cyan-300/35 bg-slate-950/90 shadow-[0_0_0_1px_rgba(15,23,42,0.9),0_18px_50px_rgba(0,0,0,0.55),0_0_24px_rgba(34,211,238,0.08)] backdrop-blur-md [clip-path:polygon(0_0,calc(100%-14px)_0,100%_14px,100%_100%,14px_100%,0_calc(100%-14px))]">
             <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-linear-to-r from-transparent via-cyan-300 to-transparent" />
 
@@ -1869,6 +1904,15 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
                 </div>
                 <button
                   type="button"
+                  aria-expanded={!isRoamHudCollapsed}
+                  aria-label={isRoamHudCollapsed ? "Expand travel HUD" : "Collapse travel HUD"}
+                  onClick={() => setIsRoamHudCollapsed((collapsed) => !collapsed)}
+                  className="border border-cyan-300/45 px-2 py-1 font-mono text-[8px] uppercase text-cyan-200 hover:bg-cyan-300/10"
+                >
+                  {isRoamHudCollapsed ? "Show ▾" : "Hide ▴"}
+                </button>
+                <button
+                  type="button"
                   onClick={openModeMenu}
                   className="border border-slate-600 px-2 py-1 font-mono text-[8px] uppercase text-slate-400 hover:border-cyan-300 hover:text-cyan-200"
                 >
@@ -1876,6 +1920,8 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
                 </button>
               </div>
             </header>
+
+            <div className={isRoamHudCollapsed ? "hidden" : "block"}>
 
             <section className="px-4 py-3">
               <div className="mb-2.5 flex items-end justify-between">
@@ -1995,8 +2041,12 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
               <span>Nav System 01</span>
               <span>{checkpoints.length ? "Route armed" : "Awaiting target"}</span>
             </footer>
+            </div>
           </div>
         </aside>
+        )}
+        {gameMode === "roam" && !isModeMenuOpen && (
+          <MobileRoamControls onInputChange={handleRoamTouchInput} />
         )}
         {gameMode === "command" && !isModeMenuOpen && (
           <RtsHud
