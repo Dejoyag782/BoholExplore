@@ -8,11 +8,12 @@ interface MapMarkerProps {
   style?: React.CSSProperties;
   popupContent?: string;
   title?: string;
+  label?: string;
   [key: string]: any;
 }
 
 const MapMarker = (props: MapMarkerProps) => {
-  const { lat, lng, imgUrl, style, popupContent, title, ...rest } = props;
+  const { lat, lng, imgUrl, style, popupContent, title, label, ...rest } = props;
   const [showPopup, setShowPopup] = useState(false);
 
   return (
@@ -43,12 +44,14 @@ const MapMarker = (props: MapMarkerProps) => {
           />
         ) : (
           <div
-            className="w-4 h-4 bg-red-500 rounded-full cursor-pointer"
+            className="flex h-6 min-w-6 cursor-pointer items-center justify-center rounded-full border-2 border-white bg-red-500 px-1 text-[10px] font-bold text-white shadow-lg"
             onClick={(e) => {
               e.stopPropagation();
               setShowPopup(true);
             }}
-          />
+          >
+            {label}
+          </div>
         )}
       </Marker>
 
