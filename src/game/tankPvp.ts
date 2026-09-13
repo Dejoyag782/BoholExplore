@@ -29,11 +29,10 @@ export const IDLE_TANK_INPUT: TankInput = { forward: 0, turn: 0, firing: false }
 export const TANK_MAX_HP = 100;
 export const TANK_SPEED_METERS = 24;
 export const TANK_TURN_SPEED = 1.65;
-export const TANK_FIRE_RANGE_METERS = 95;
+export const TANK_FIRE_RANGE_METERS = 180;
 export const TANK_FIRE_COOLDOWN = 0.7;
 export const TANK_DAMAGE = 34;
 export const TANK_RESPAWN_SECONDS = 3;
-export const TANK_ARENA_RADIUS_METERS = 240;
 
 const PLAYER_COLORS = ["#22d3ee", "#fb7185", "#fbbf24", "#a78bfa", "#4ade80", "#f97316"];
 const normalizeAngle = (angle: number) => Math.atan2(Math.sin(angle), Math.cos(angle));
@@ -84,7 +83,6 @@ const targetInSight = (shooter: TankPlayer, candidates: TankPlayer[]) => {
 export const stepTankBattle = (
   sourcePlayers: TankPlayer[],
   inputs: ReadonlyMap<string, TankInput>,
-  origin: [number, number],
   deltaSeconds: number
 ) => {
   const delta = Math.max(0, Math.min(deltaSeconds, 0.05));
@@ -99,15 +97,11 @@ export const stepTankBattle = (
     const input = inputs.get(player.id) ?? IDLE_TANK_INPUT;
     const heading = normalizeAngle(player.heading + input.turn * TANK_TURN_SPEED * delta);
     const travel = input.forward * TANK_SPEED_METERS * delta;
-    const candidatePosition = offsetMeters(
+    const position = offsetMeters(
       player.position,
       Math.cos(heading) * travel,
       Math.sin(heading) * travel
     );
-    const position =
-      distanceMeters(origin, candidatePosition) <= TANK_ARENA_RADIUS_METERS
-        ? candidatePosition
-        : player.position;
     return { ...player, heading, position, cooldown: Math.max(0, player.cooldown - delta) };
   });
 

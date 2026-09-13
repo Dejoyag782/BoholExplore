@@ -14,6 +14,33 @@ type ClientMessage =
   | { type: "input"; input: TankInput };
 type HostMessage = { type: "snapshot"; players: TankPlayer[] };
 
+const PARTY_CODE_ALPHABET = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+const PARTY_CODE_LENGTH = 6;
+const PARTY_PEER_PREFIX = "bt3d-";
+const PARTY_CODE_PATTERN = /^[A-HJ-NP-Z2-9]{6}$/;
+
+export const createTankPartyCode = () => {
+  const randomBytes = crypto.getRandomValues(new Uint8Array(PARTY_CODE_LENGTH));
+  return Array.from(
+    randomBytes,
+    (value) => PARTY_CODE_ALPHABET[value % PARTY_CODE_ALPHABET.length]
+  ).join("");
+};
+
+export const partyPeerIdFromCode = (value: string) => {
+  const trimmed = value.trim();
+  const shortCode = trimmed.toUpperCase();
+  if (PARTY_CODE_PATTERN.test(shortCode)) {
+    return `${PARTY_PEER_PREFIX}${shortCode.toLowerCase()}`;
+  }
+  return trimmed;
+};
+
+const displayCodeFromPeerId = (peerId: string) =>
+  peerId.toLowerCase().startsWith(PARTY_PEER_PREFIX)
+    ? peerId.slice(PARTY_PEER_PREFIX.length).toUpperCase()
+    : peerId;
+
 const isTankInput = (value: unknown): value is TankInput => {
   if (!value || typeof value !== "object") return false;
   const input = value as Partial<TankInput>;
@@ -98,12 +125,13 @@ export const useTankParty = (active: boolean, origin: [number, number]) => {
     setStatus("connecting");
     try {
       const { Peer: PeerClient } = await import("peerjs");
-      const peer = new PeerClient();
+      const partyCode = createTankPartyCode();
+      const peer = new PeerClient(partyPeerIdFromCode(partyCode));
       peerRef.current = peer;
       peer.on("open", (id) => {
         const host = createTankPlayer(id, name, originRef.current, 0);
         setLocalPeerId(id);
-        setPartyCode(id);
+        setPartyCode(partyCode);
         setIsHost(true);
         setStatus("hosting");
         inputsRef.current.set(id, localInputRef.current);
@@ -146,10 +174,10 @@ export const useTankParty = (active: boolean, origin: [number, number]) => {
   }, [leaveParty, publishPlayers]);
 
   const joinParty = useCallback(async (code: string, name: string) => {
-    const hostId = code.trim();
+    const hostId = partyPeerIdFromCode(code);
     if (!hostId) return;
     leaveParty();
-    setPartyCode(hostId);
+    setPartyCode(displayCodeFromPeerId(hostId));
     setStatus("connecting");
     try {
       const { Peer: PeerClient } = await import("peerjs");
@@ -212,7 +240,6 @@ export const useTankParty = (active: boolean, origin: [number, number]) => {
       const next = stepTankBattle(
         playersRef.current,
         inputsRef.current,
-        originRef.current,
         (now - previous) / 1000
       );
       previous = now;

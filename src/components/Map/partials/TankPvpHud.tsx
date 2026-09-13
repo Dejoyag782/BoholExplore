@@ -54,7 +54,7 @@ const TankPvpHud = ({
           </div>
           <div className="my-5 flex items-center gap-3 text-[9px] uppercase tracking-widest text-slate-600"><span className="h-px flex-1 bg-slate-800" />or join host<span className="h-px flex-1 bg-slate-800" /></div>
           <div className="flex gap-2">
-            <input aria-label="Party code" value={code} onChange={(event) => setCode(event.target.value)} placeholder="Paste host party code" className="min-w-0 flex-1 border border-slate-700 bg-slate-900 px-3 py-2.5 font-mono text-xs uppercase text-white outline-none focus:border-cyan-300" />
+            <input aria-label="Party code" value={code} onChange={(event) => setCode(event.target.value)} placeholder="6-character code" autoCapitalize="characters" autoComplete="off" spellCheck={false} className="min-w-0 flex-1 border border-slate-700 bg-slate-900 px-3 py-2.5 font-mono text-xs uppercase tracking-widest text-white outline-none focus:border-cyan-300" />
             <button type="button" disabled={!code.trim() || status === "connecting"} onClick={() => onJoin(code, name)} className="border border-cyan-300 bg-cyan-300 px-4 text-xs font-black uppercase text-slate-950 disabled:opacity-40">Join</button>
           </div>
           {status === "connecting" && <p className="mt-3 font-mono text-xs text-cyan-300">Establishing peer connection…</p>}
@@ -73,7 +73,7 @@ const TankPvpHud = ({
         <button type="button" onClick={onChangeMode} className="border border-slate-600 px-2 py-1 font-mono text-[9px] uppercase">Modes</button>
       </header>
       <div className="border-b border-slate-700 px-4 py-3">
-        <div className="flex items-center gap-2"><code className="min-w-0 flex-1 truncate bg-black/35 px-2 py-2 text-[10px] text-cyan-200">{partyCode}</code><button type="button" onClick={() => void navigator.clipboard.writeText(partyCode)} className="border border-cyan-300/50 px-2 py-2 text-[9px] font-bold uppercase text-cyan-200">Copy</button></div>
+        <div className="flex items-center gap-2"><code className="min-w-0 flex-1 truncate bg-black/35 px-2 py-2 text-sm font-black tracking-[0.22em] text-cyan-200">{partyCode}</code><button type="button" onClick={() => void navigator.clipboard.writeText(partyCode)} className="border border-cyan-300/50 px-2 py-2 text-[9px] font-bold uppercase text-cyan-200">Copy</button></div>
         <p className="mt-2 hidden font-mono text-[9px] text-slate-500 md:block">W/S DRIVE · A/D TURN · SPACE FIRE</p>
         <p className="mt-2 font-mono text-[9px] text-slate-500 md:hidden">JOYSTICK DRIVE · HOLD FIRE</p>
       </div>

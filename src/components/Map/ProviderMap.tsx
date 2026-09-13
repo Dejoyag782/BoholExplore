@@ -41,11 +41,15 @@ const MANUAL_SPEED_FACTOR = 0.12;
 const TURN_SPEED_RADIANS = 1.8;
 const GRAVITY = 22;
 const TERRAIN_LOOKAHEAD_METERS = 8;
+const TERRAIN_WIDTH_SAMPLE_METERS = 5;
 const RAMP_TAKEOFF_SLOPE = 0.08;
 const DROP_TAKEOFF_SLOPE = -0.15;
 const FOLLOW_DISTANCE_METERS = 30;
 const FOLLOW_ZOOM = 18.5;
 const MAX_FOLLOW_DRIFT_METERS = 180;
+const TANK_FOLLOW_ZOOM = 18.4;
+const TANK_CAMERA_PITCH = 58;
+const TANK_CAMERA_LOOK_AHEAD_METERS = 18;
 
 type EngineAudioGraph = {
   context: AudioContext;
@@ -106,6 +110,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const providerCoordRef = useRef<[number, number] | null>(null);
   const providerHeadingRef = useRef<number | null>(null);
   const providerPitchRef = useRef<number | null>(null);
+  const providerRollRef = useRef<number | null>(null);
   const modelAltitudeOverrideRef = useRef<number | null>(null);
   const manualAnimationRef = useRef<number | null>(null);
   const pressedKeysRef = useRef<Set<string>>(new Set());
@@ -133,6 +138,8 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const orbitAnimationRef = useRef<number | null>(null);
   const cameraCenterRef = useRef<[number, number] | null>(null);
   const cameraBearingRef = useRef<number | null>(null);
+  const tankCameraCenterRef = useRef<[number, number] | null>(null);
+  const tankCameraBearingRef = useRef<number | null>(null);
   const animationDataRef = useRef({
     progress: 0,
     totalDistance: 0,
@@ -497,7 +504,15 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
       map.easeTo({ center, zoom: Math.max(15, map.getZoom()), pitch: 55, bearing: 0, duration: 600 });
     }
     if (mode === "pvp" && map) {
-      map.easeTo({ center: pvpOrigin, zoom: 17.5, pitch: 68, bearing: 0, duration: 600 });
+      tankCameraCenterRef.current = null;
+      tankCameraBearingRef.current = null;
+      map.easeTo({
+        center: pvpOrigin,
+        zoom: TANK_FOLLOW_ZOOM,
+        pitch: TANK_CAMERA_PITCH,
+        bearing: 0,
+        duration: 600,
+      });
     }
   }, [activeProvider, mapRef, playRtsEffect, pvpOrigin, updateRtsVehicleAudio]);
 
@@ -559,6 +574,35 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
       position[0] + (Math.cos(heading) * distanceMeters) / longitudeScale,
       position[1] + (Math.sin(heading) * distanceMeters) / latitudeScale,
     ];
+  };
+  const getRoamTerrainOrientation = (
+    map: MapLibreMap,
+    position: [number, number],
+    heading: number
+  ) => {
+    const front = offsetCoordinate(position, heading, TERRAIN_LOOKAHEAD_METERS);
+    const back = offsetCoordinate(position, heading, -TERRAIN_LOOKAHEAD_METERS);
+    const right = offsetCoordinate(position, heading - Math.PI / 2, TERRAIN_WIDTH_SAMPLE_METERS);
+    const left = offsetCoordinate(position, heading + Math.PI / 2, TERRAIN_WIDTH_SAMPLE_METERS);
+    const frontElevation = map.queryTerrainElevation(front);
+    const backElevation = map.queryTerrainElevation(back);
+    const rightElevation = map.queryTerrainElevation(right);
+    const leftElevation = map.queryTerrainElevation(left);
+    const pitch = frontElevation == null || backElevation == null
+      ? 0
+      : clamp(
+          Math.atan2(frontElevation - backElevation, TERRAIN_LOOKAHEAD_METERS * 2),
+          -0.55,
+          0.55
+        );
+    const roll = rightElevation == null || leftElevation == null
+      ? 0
+      : clamp(
+          Math.atan2(rightElevation - leftElevation, TERRAIN_WIDTH_SAMPLE_METERS * 2),
+          -0.55,
+          0.55
+        );
+    return { pitch, roll };
   };
   const offsetCenterByBearing = (
     map: MapLibreMap,
@@ -700,13 +744,17 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
 
       const map = mapRef?.getMap();
       if (map?.queryTerrainElevation) {
-        const elevA = map.queryTerrainElevation(a) ?? 0;
-        const elevB = map.queryTerrainElevation(b) ?? elevA;
-        const horiz = haversineMeters(a, b) || 1;
-        const pitch = -Math.atan2(elevB - elevA, horiz);
-        const currentPitch = providerPitchRef.current ?? pitch;
-        providerPitchRef.current = smoothAngle(currentPitch, pitch, 0.2);
+        const orientation = getRoamTerrainOrientation(
+          map,
+          providerCoordRef.current,
+          providerHeadingRef.current
+        );
+        const currentPitch = providerPitchRef.current ?? orientation.pitch;
+        const currentRoll = providerRollRef.current ?? orientation.roll;
+        providerPitchRef.current = smoothAngle(currentPitch, orientation.pitch, 0.2);
         providerPitchRef.current = clamp(providerPitchRef.current, -0.6, 0.6);
+        providerRollRef.current = smoothAngle(currentRoll, orientation.roll, 0.2);
+        providerRollRef.current = clamp(providerRollRef.current, -0.6, 0.6);
       }
 
       mapRef?.getMap()?.triggerRepaint();
@@ -1045,6 +1093,18 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     const map = mapRef?.getMap();
     if (!map || gameMode !== "roam" || isModeMenuOpen) return;
 
+    const initialPosition = providerCoordRef.current;
+    if (initialPosition) {
+      const initialOrientation = getRoamTerrainOrientation(
+        map,
+        initialPosition,
+        providerHeadingRef.current ?? 0
+      );
+      providerPitchRef.current = initialOrientation.pitch;
+      providerRollRef.current = initialOrientation.roll;
+      map.triggerRepaint();
+    }
+
     let previousTime = performance.now();
 
     const tick = (now: number) => {
@@ -1063,7 +1123,6 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
         if (steering !== 0) {
           heading = normalizeAngle(heading + steering * TURN_SPEED_RADIANS * deltaSeconds);
           providerHeadingRef.current = heading;
-          providerPitchRef.current = 0;
         }
 
         if (travelSpeed !== 0) {
@@ -1106,10 +1165,25 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
             }
 
             terrainSlopeRef.current = slope;
-            if (!airborneRef.current) {
-              providerPitchRef.current = clamp(-Math.atan(slope), -0.55, 0.55);
-            }
           }
+        }
+
+        if (!airborneRef.current && providerCoordRef.current) {
+          const orientation = getRoamTerrainOrientation(
+            map,
+            providerCoordRef.current,
+            heading
+          );
+          providerPitchRef.current = smoothAngle(
+            providerPitchRef.current ?? orientation.pitch,
+            orientation.pitch,
+            0.18
+          );
+          providerRollRef.current = smoothAngle(
+            providerRollRef.current ?? orientation.roll,
+            orientation.roll,
+            0.18
+          );
         }
       }
 
@@ -1127,11 +1201,17 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
           verticalVelocityRef.current = 0;
           airborneSpeedRef.current = 0;
           modelAltitudeOverrideRef.current = null;
-          providerPitchRef.current = 0;
+          const orientation = getRoamTerrainOrientation(
+            map,
+            providerCoordRef.current,
+            providerHeadingRef.current ?? 0
+          );
+          providerPitchRef.current = orientation.pitch;
+          providerRollRef.current = orientation.roll;
         } else {
           modelAltitudeOverrideRef.current = nextAltitude;
           providerPitchRef.current = clamp(
-            -Math.atan2(verticalVelocityRef.current, Math.max(1, Math.abs(travelSpeed))),
+            Math.atan2(verticalVelocityRef.current, Math.max(1, Math.abs(travelSpeed))),
             -0.6,
             0.6
           );
@@ -1425,12 +1505,24 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     const localTank = tankParty.players.find((player) => player.id === tankParty.localPeerId);
     const map = mapRef?.getMap();
     if (!localTank || !map) return;
-    const center = offsetCoordinate(localTank.position, localTank.heading, -34);
+    const targetCenter = offsetCoordinate(
+      localTank.position,
+      localTank.heading,
+      TANK_CAMERA_LOOK_AHEAD_METERS
+    );
+    const center = smoothCoord(tankCameraCenterRef.current, targetCenter, 0.38);
+    const targetBearing = normalizeDegrees(90 - (localTank.heading * 180) / Math.PI);
+    const bearing = tankCameraBearingRef.current == null
+      ? targetBearing
+      : smoothDegrees(tankCameraBearingRef.current, targetBearing, 0.42);
+    tankCameraCenterRef.current = center;
+    tankCameraBearingRef.current = bearing;
+    map.setCenterClampedToGround(true);
     map.jumpTo({
       center,
-      zoom: 17.8,
-      pitch: 68,
-      bearing: normalizeDegrees(90 - (localTank.heading * 180) / Math.PI),
+      zoom: TANK_FOLLOW_ZOOM,
+      pitch: TANK_CAMERA_PITCH,
+      bearing,
     });
   }, [gameMode, isModeMenuOpen, mapRef, tankParty.localPeerId, tankParty.players]);
 
@@ -2019,6 +2111,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
                     headingRef={isProvider ? providerHeadingRef : undefined}
                     headingOffset={isProvider ? -Math.PI / 2 : 0}
                     pitchRef={isProvider ? providerPitchRef : undefined}
+                    rollRef={isProvider ? providerRollRef : undefined}
                     onRenderFrame={isProvider ? handleProviderRenderFrame : undefined}
                     modelPath={index === 0 && parsedCoords.length === 2 ? "/models/cave.glb" : "/models/orc_rammer.glb"}
                 />

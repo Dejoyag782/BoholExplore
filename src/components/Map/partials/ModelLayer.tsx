@@ -15,6 +15,7 @@ type ModelLayerProps = {
   headingOffset?: number;
   pitchRef?: React.MutableRefObject<number | null>;
   pitchOffset?: number;
+  rollRef?: React.MutableRefObject<number | null>;
   onRenderFrame?: (frame: {
     map: maplibregl.Map;
     coordinate: [number, number];
@@ -28,6 +29,10 @@ function zoomToScale(zoom: number) {
   return Math.max(10, Math.pow(2, 20 - zoom));
 }
 
+const UP_AXIS = new THREE.Vector3(0, 1, 0);
+const PITCH_AXIS = new THREE.Vector3(1, 0, 0);
+const ROLL_AXIS = new THREE.Vector3(0, 0, 1);
+
 const ModelLayer = ({
   map = null,
   coordinates = [123.685, 10.35],
@@ -40,6 +45,7 @@ const ModelLayer = ({
   headingOffset = 0,
   pitchRef,
   pitchOffset = 0,
+  rollRef,
   onRenderFrame,
 }: ModelLayerProps) => {
   const modelScaleRef = useRef(10);
@@ -62,8 +68,8 @@ const ModelLayer = ({
 
     class ThreeModelLayer implements maplibregl.CustomLayerInterface {
       id = resolvedLayerId;
-      type: "custom" = "custom";
-      renderingMode: "3d" = "3d";
+      readonly type = "custom" as const;
+      readonly renderingMode = "3d" as const;
 
       private map!: maplibregl.Map;
       private scene = new THREE.Scene();
@@ -178,10 +184,14 @@ const ModelLayer = ({
 
         const heading = headingRef?.current ?? null;
         const pitch = pitchRef?.current ?? null;
-        if (heading != null || pitch != null) {
+        const roll = rollRef?.current ?? null;
+        if (heading != null || pitch != null || roll != null) {
           const yaw = (heading ?? 0) + headingOffset;
           const tilt = (pitch ?? 0) + pitchOffset;
-          this.model.rotation.set(tilt, yaw, 0);
+          this.model.quaternion
+            .setFromAxisAngle(UP_AXIS, yaw)
+            .multiply(new THREE.Quaternion().setFromAxisAngle(PITCH_AXIS, tilt))
+            .multiply(new THREE.Quaternion().setFromAxisAngle(ROLL_AXIS, roll ?? 0));
         }
 
         if (onRenderFrame) {
@@ -222,7 +232,7 @@ const ModelLayer = ({
         map.removeLayer(resolvedLayerId);
       }
     };
-  }, [map, modelPath, layerId, onRenderFrame, coordinatesRef, elevationOffset, altitudeOverrideRef, headingRef, headingOffset, pitchRef, pitchOffset]);
+  }, [map, modelPath, layerId, onRenderFrame, coordinatesRef, elevationOffset, altitudeOverrideRef, headingRef, headingOffset, pitchRef, pitchOffset, rollRef]);
 
   return null;
 };
