@@ -2227,7 +2227,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
                     pitchRef={isProvider ? providerPitchRef : undefined}
                     rollRef={isProvider ? providerRollRef : undefined}
                     onRenderFrame={isProvider ? handleProviderRenderFrame : undefined}
-                    modelPath={index === 0 && parsedCoords.length === 2 ? "/models/cave.glb" : "/models/orc_rammer.glb"}
+                    modelPath={index === 0 && parsedCoords.length === 2 ? "/models/cave.glb" : "/models/hrc2_monster_truck.glb"}
                 />
               </Fragment>
             );
