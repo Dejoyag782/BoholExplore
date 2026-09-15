@@ -3,7 +3,7 @@ import type { PointerEvent as ReactPointerEvent } from "react";
 import type { TankInput } from "../../../game/tankPvp";
 
 interface MobileTankControlsProps {
-  onInputChange: (input: TankInput) => void;
+  onInputChange: (input: Omit<TankInput, "aimHeading">) => void;
 }
 
 const STICK_TRAVEL = 42;
@@ -13,11 +13,16 @@ const MobileTankControls = ({ onInputChange }: MobileTankControlsProps) => {
   const joystickRef = useRef<HTMLDivElement>(null);
   const joystickPointerRef = useRef<number | null>(null);
   const firePointerRef = useRef<number | null>(null);
-  const inputRef = useRef<TankInput>({ forward: 0, turn: 0, firing: false });
+  const inputRef = useRef<Omit<TankInput, "aimHeading">>({
+    forward: 0,
+    turn: 0,
+    firing: false,
+    gear: 2,
+  });
   const [stickPosition, setStickPosition] = useState({ x: 0, y: 0 });
   const [isFiring, setIsFiring] = useState(false);
 
-  const publishInput = useCallback((patch: Partial<TankInput>) => {
+  const publishInput = useCallback((patch: Partial<Omit<TankInput, "aimHeading">>) => {
     inputRef.current = { ...inputRef.current, ...patch };
     onInputChange(inputRef.current);
   }, [onInputChange]);
@@ -93,7 +98,7 @@ const MobileTankControls = ({ onInputChange }: MobileTankControlsProps) => {
   };
 
   useEffect(() => () => {
-    onInputChange({ forward: 0, turn: 0, firing: false });
+    onInputChange({ forward: 0, turn: 0, firing: false, gear: inputRef.current.gear });
   }, [onInputChange]);
 
   return (

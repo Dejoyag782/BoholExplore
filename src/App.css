@@ -172,3 +172,34 @@
     @apply bg-background text-foreground;
   }
 }
+
+.mobile-landscape-gate {
+  display: none;
+}
+
+@media (orientation: portrait) and (pointer: coarse) {
+  .mobile-landscape-gate {
+    display: grid;
+  }
+}
+
+@keyframes rotate-device-landscape {
+  0%, 18% {
+    transform: rotate(0deg);
+  }
+
+  72%, 100% {
+    transform: rotate(90deg);
+  }
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .rotate-device-icon {
+    animation: rotate-device-landscape 1.8s ease-in-out infinite alternate;
+  }
+}
+
+
+.maplibregl-ctrl-bottom-right{
+  display: none !important;
+}

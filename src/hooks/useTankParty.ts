@@ -3,6 +3,7 @@ import type { DataConnection, Peer } from "peerjs";
 import {
   createTankPlayer,
   IDLE_TANK_INPUT,
+  normalizeAngle,
   stepTankBattle,
   type TankInput,
   type TankPlayer,
@@ -50,7 +51,10 @@ const isTankInput = (value: unknown): value is TankInput => {
   return (
     typeof input.forward === "number" &&
     typeof input.turn === "number" &&
-    typeof input.firing === "boolean"
+    typeof input.firing === "boolean" &&
+    (input.gear === 1 || input.gear === 2 || input.gear === 3) &&
+    (input.aimHeading === null ||
+      (typeof input.aimHeading === "number" && Number.isFinite(input.aimHeading)))
   );
 };
 
@@ -67,6 +71,10 @@ const clientMessage = (value: unknown): ClientMessage | null => {
         forward: Math.max(-1, Math.min(1, message.input.forward)),
         turn: Math.max(-1, Math.min(1, message.input.turn)),
         firing: message.input.firing,
+        gear: message.input.gear,
+        aimHeading: message.input.aimHeading == null
+          ? null
+          : normalizeAngle(message.input.aimHeading),
       },
     };
   }

@@ -4,6 +4,17 @@ export type TankInput = {
   forward: number;
   turn: number;
   firing: boolean;
+  gear: TankGear;
+  aimHeading: number | null;
+};
+
+export type TankGear = 1 | 2 | 3;
+
+export type TankProjectile = {
+  id: number;
+  from: [number, number];
+  to: [number, number];
+  remainingSeconds: number;
 };
 
 export type TankPlayer = {
@@ -13,6 +24,7 @@ export type TankPlayer = {
   position: [number, number];
   spawnPosition: [number, number];
   heading: number;
+  turretHeading: number;
   hp: number;
   score: number;
   deaths: number;
@@ -26,20 +38,36 @@ export type TankPlayer = {
   airborneSpeed: number;
   terrainSlope: number;
   shotSequence: number;
+  projectile: TankProjectile | null;
   lastShot: {
     from: [number, number];
     to: [number, number];
   } | null;
 };
 
-export const IDLE_TANK_INPUT: TankInput = { forward: 0, turn: 0, firing: false };
+export const IDLE_TANK_INPUT: TankInput = {
+  forward: 0,
+  turn: 0,
+  firing: false,
+  gear: 2,
+  aimHeading: null,
+};
 export const TANK_MAX_HP = 100;
 export const TANK_SPEED_METERS = 60;
+export const TANK_GEAR_SPEEDS: Record<TankGear, number> = {
+  1: 30,
+  2: 45,
+  3: TANK_SPEED_METERS,
+};
 export const TANK_TURN_SPEED = 1.8;
+export const TANK_TURRET_TURN_SPEED = 2.4;
 export const TANK_FIRE_RANGE_METERS = 180;
 export const TANK_FIRE_COOLDOWN = 1;
 export const TANK_SPAWN_RADIUS_METERS = 100;
 export const TANK_DAMAGE = 34;
+export const TANK_PROJECTILE_SPEED_METERS_PER_SECOND = 260;
+export const TANK_PROJECTILE_MIN_FLIGHT_SECONDS = 0.42;
+export const TANK_PROJECTILE_HIT_RADIUS_METERS = 8;
 export const TANK_RESPAWN_SECONDS = 3;
 export const TANK_GRAVITY = 22;
 export const TANK_TERRAIN_LOOKAHEAD_METERS = 8;
@@ -51,7 +79,19 @@ export const TANK_MAX_AIR_HEIGHT_METERS = 3;
 export type TankTerrainElevation = (position: [number, number]) => number | null | undefined;
 
 const PLAYER_COLORS = ["#22d3ee", "#fb7185", "#fbbf24", "#a78bfa", "#4ade80", "#f97316"];
-const normalizeAngle = (angle: number) => Math.atan2(Math.sin(angle), Math.cos(angle));
+export const normalizeAngle = (angle: number) => Math.atan2(Math.sin(angle), Math.cos(angle));
+
+export const bearingRadians = (from: [number, number], to: [number, number]) => {
+  const latitude = ((from[1] + to[1]) / 2) * (Math.PI / 180);
+  const east = (to[0] - from[0]) * Math.cos(latitude);
+  const north = to[1] - from[1];
+  return Math.atan2(north, east);
+};
+
+const rotateToward = (current: number, target: number, maxStep: number) => {
+  const delta = normalizeAngle(target - current);
+  return normalizeAngle(current + Math.max(-maxStep, Math.min(maxStep, delta)));
+};
 
 export const createTankPlayer = (
   id: string,
@@ -66,13 +106,15 @@ export const createTankPlayer = (
     Math.cos(angle) * distance,
     Math.sin(angle) * distance
   );
+  const heading = normalizeAngle(angle + Math.PI);
   return {
     id,
     name: name.trim().slice(0, 18) || `Tank ${index + 1}`,
     color: PLAYER_COLORS[index % PLAYER_COLORS.length],
     position,
     spawnPosition: position,
-    heading: normalizeAngle(angle + Math.PI),
+    heading,
+    turretHeading: heading,
     hp: TANK_MAX_HP,
     score: 0,
     deaths: 0,
@@ -86,6 +128,7 @@ export const createTankPlayer = (
     airborneSpeed: 0,
     terrainSlope: 0,
     shotSequence: 0,
+    projectile: null,
     lastShot: null,
   };
 };
@@ -97,15 +140,24 @@ const targetInSight = (shooter: TankPlayer, candidates: TankPlayer[]) => {
     if (candidate.id === shooter.id || candidate.hp <= 0) continue;
     const distance = distanceMeters(shooter.position, candidate.position);
     if (distance > TANK_FIRE_RANGE_METERS || distance >= nearestDistance) continue;
-    const bearing = Math.atan2(
-      candidate.position[1] - shooter.position[1],
-      candidate.position[0] - shooter.position[0]
-    );
-    if (Math.abs(normalizeAngle(bearing - shooter.heading)) > 0.2) continue;
+    const bearing = bearingRadians(shooter.position, candidate.position);
+    if (Math.abs(normalizeAngle(bearing - shooter.turretHeading)) > 0.2) continue;
     target = candidate;
     nearestDistance = distance;
   }
   return target;
+};
+
+export const getTankShotEnd = (
+  shooter: TankPlayer,
+  candidates: TankPlayer[]
+): [number, number] => {
+  const target = targetInSight(shooter, candidates);
+  return target?.position ?? offsetMeters(
+    shooter.position,
+    Math.cos(shooter.turretHeading) * TANK_FIRE_RANGE_METERS,
+    Math.sin(shooter.turretHeading) * TANK_FIRE_RANGE_METERS
+  );
 };
 
 export const stepTankBattle = (
@@ -131,13 +183,25 @@ export const stepTankBattle = (
             verticalVelocity: 0,
             airborneSpeed: 0,
             terrainSlope: 0,
+            turretHeading: player.heading,
+            cooldown: 0,
+            projectile: null,
+            lastShot: null,
           }
         : { ...player, respawnIn };
     }
 
     const input = inputs.get(player.id) ?? IDLE_TANK_INPUT;
     const heading = normalizeAngle(player.heading + input.turn * TANK_TURN_SPEED * delta);
-    const inputSpeed = input.forward * TANK_SPEED_METERS;
+    const requestedAim = input.aimHeading != null && Number.isFinite(input.aimHeading)
+      ? normalizeAngle(input.aimHeading)
+      : heading;
+    const turretHeading = rotateToward(
+      player.turretHeading,
+      requestedAim,
+      TANK_TURRET_TURN_SPEED * delta
+    );
+    const inputSpeed = input.forward * TANK_GEAR_SPEEDS[input.gear];
     const travelSpeed = player.airborne ? player.airborneSpeed : inputSpeed;
     const travel = travelSpeed * delta;
     const position = offsetMeters(
@@ -215,6 +279,7 @@ export const stepTankBattle = (
     return {
       ...player,
       heading,
+      turretHeading,
       position,
       cooldown: Math.max(0, player.cooldown - delta),
       airborne,
@@ -228,23 +293,51 @@ export const stepTankBattle = (
   });
 
   const damage = new Map<string, { amount: number; attackerId: string }>();
-  const fired = moved.map((player) => {
+  const advanced = moved.map((player) => {
+    if (!player.projectile) return player;
+    const remainingSeconds = player.projectile.remainingSeconds - delta;
+    if (remainingSeconds > 0) {
+      return {
+        ...player,
+        projectile: { ...player.projectile, remainingSeconds },
+      };
+    }
+
+    let hitTarget: TankPlayer | undefined;
+    let nearestDistance = TANK_PROJECTILE_HIT_RADIUS_METERS;
+    for (const candidate of moved) {
+      if (candidate.id === player.id || candidate.hp <= 0) continue;
+      const distance = distanceMeters(player.projectile.to, candidate.position);
+      if (distance > nearestDistance) continue;
+      hitTarget = candidate;
+      nearestDistance = distance;
+    }
+    if (hitTarget) {
+      const hit = damage.get(hitTarget.id) ?? { amount: 0, attackerId: player.id };
+      damage.set(hitTarget.id, { amount: hit.amount + TANK_DAMAGE, attackerId: player.id });
+    }
+    return { ...player, projectile: null };
+  });
+
+  const fired = advanced.map((player) => {
     const input = inputs.get(player.id) ?? IDLE_TANK_INPUT;
     if (player.hp <= 0 || !input.firing || player.cooldown > 0) return player;
-    const target = targetInSight(player, moved);
-    const shotEnd = target?.position ?? offsetMeters(
-      player.position,
-      Math.cos(player.heading) * TANK_FIRE_RANGE_METERS,
-      Math.sin(player.heading) * TANK_FIRE_RANGE_METERS
-    );
-    if (target) {
-      const hit = damage.get(target.id) ?? { amount: 0, attackerId: player.id };
-      damage.set(target.id, { amount: hit.amount + TANK_DAMAGE, attackerId: player.id });
-    }
+    const shotEnd = getTankShotEnd(player, advanced);
+    const shotDistance = distanceMeters(player.position, shotEnd);
+    const shotSequence = player.shotSequence + 1;
     return {
       ...player,
       cooldown: TANK_FIRE_COOLDOWN,
-      shotSequence: player.shotSequence + 1,
+      shotSequence,
+      projectile: {
+        id: shotSequence,
+        from: player.position,
+        to: shotEnd,
+        remainingSeconds: Math.max(
+          TANK_PROJECTILE_MIN_FLIGHT_SECONDS,
+          shotDistance / TANK_PROJECTILE_SPEED_METERS_PER_SECOND
+        ),
+      },
       lastShot: { from: player.position, to: shotEnd },
     };
   });

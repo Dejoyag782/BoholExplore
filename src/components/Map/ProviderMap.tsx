@@ -20,6 +20,7 @@ import RtsHud from "./partials/RtsHud";
 import TankPvpHud from "./partials/TankPvpHud";
 import TankPvpLayer from "./partials/TankPvpLayer";
 import MobileRoamControls, { type RoamInput } from "./partials/MobileRoamControls";
+import GearShift from "./partials/GearShift";
 import GameModeMenu from "../GameModeMenu";
 import { useTankParty } from "../../hooks/useTankParty";
 import { getGtaGameStyle } from "../../utils/mapStyle";
@@ -37,14 +38,18 @@ import {
 } from "../../game/rts";
 import { getRtsAudioFrame } from "../../game/rtsAudio";
 import {
+  bearingRadians,
+  IDLE_TANK_INPUT,
+  TANK_GEAR_SPEEDS,
   TANK_SPAWN_RADIUS_METERS,
+  type TankGear,
   type TankInput,
 } from "../../game/tankPvp";
 
 const BASE_MODEL_ELEVATION = 7;
 const MANUAL_SPEED_FACTOR = 0.12;
 const TURN_SPEED_RADIANS = 1.8;
-const GRAVITY = 22;
+const GRAVITY = 100;
 const TERRAIN_LOOKAHEAD_METERS = 8;
 const TERRAIN_WIDTH_SAMPLE_METERS = 5;
 const RAMP_TAKEOFF_SLOPE = 0.08;
@@ -52,8 +57,24 @@ const DROP_TAKEOFF_SLOPE = -0.15;
 const FOLLOW_DISTANCE_METERS = 30;
 const FOLLOW_ZOOM = 18.5;
 const MAX_FOLLOW_DRIFT_METERS = 180;
-const TANK_FOLLOW_ZOOM = 18.4;
-const TANK_CAMERA_PITCH = 58;
+const TANK_FOLLOW_ZOOM = 20;
+const TANK_CAMERA_PITCH = 10;
+const CAMERA_MODES = ["follow", "orbit", "free"] as const;
+type CameraMode = (typeof CAMERA_MODES)[number];
+
+const SPEED_PRESETS = [
+  { label: "Gear 1", value: 100 },
+  { label: "Gear 2", value: 250 },
+  { label: "Gear 3", value: 500 },
+  { label: "Gear 4", value: 1000 },
+  { label: "Gear 5", value: 2000 },
+  { label: "Gear 6", value: 3000 },
+] as const;
+
+const PVP_GEAR_PRESETS = ([1, 2, 3] as const).map((gear) => ({
+  label: `Gear ${gear}`,
+  value: TANK_GEAR_SPEEDS[gear],
+}));
 
 const createSpawnAreaFeature = (center: [number, number]) => {
   const ring = Array.from({ length: 65 }, (_, index) => {
@@ -110,6 +131,11 @@ type RtsEffect =
 const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const [gameMode, setGameMode] = useState<GameMode | null>(null);
   const [isModeMenuOpen, setIsModeMenuOpen] = useState(true);
+  const [isRoamMenuOpen, setIsRoamMenuOpen] = useState(false);
+  const [isPvpMenuOpen, setIsPvpMenuOpen] = useState(false);
+  const [isCoarsePointer] = useState(
+    () => typeof window !== "undefined" && window.matchMedia("(pointer: coarse)").matches
+  );
   const [mapRef, setMapRef] = useState<MapRef | null>(null);
   const [mapIsReady, setMapIsReady] = useState(false);
   const [boholBounds, setBoholBounds] = useState<LngLatBoundsLike | null>(null);
@@ -141,6 +167,8 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const manualAnimationRef = useRef<number | null>(null);
   const pressedKeysRef = useRef<Set<string>>(new Set());
   const roamTouchInputRef = useRef<RoamInput>({ forward: 0, turn: 0 });
+  const tankInputRef = useRef<TankInput>(IDLE_TANK_INPUT);
+  const pvpGearIndexRef = useRef(1);
   const startRoamAnimationRef = useRef<(() => void) | null>(null);
   const airborneRef = useRef(false);
   const verticalVelocityRef = useRef(0);
@@ -162,10 +190,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   const ZIP_DURATION_MS = 800;
   const easeOutCubic = (t: number) => 1 - Math.pow(1 - t, 3);
   const lastCoordsKeyRef = useRef<string | null>(null);
-  const [cameraMode, setCameraMode] = useState<"follow" | "orbit" | "free">("free");
-  const [isRoamHudCollapsed, setIsRoamHudCollapsed] = useState(
-    () => typeof window !== "undefined" && window.matchMedia("(max-width: 767px)").matches
-  );
+  const [cameraMode, setCameraMode] = useState<CameraMode>("free");
   const orbitBearingRef = useRef(0);
   const orbitAnimationRef = useRef<number | null>(null);
   const cameraCenterRef = useRef<[number, number] | null>(null);
@@ -176,14 +201,9 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     path: [] as [number, number][],
   });
   const lastFrameTimeRef = useRef<number | null>(null);
-  const SPEED_PRESETS = [
-    { label: "Slow", value: 100 },
-    { label: "Normal", value: 250 },
-    { label: "Fast", value: 500 },
-
-  ];
   const [speedIndex, setSpeedIndex] = useState(1);
-  const speedRef = useRef(SPEED_PRESETS[2].value);
+  const [pvpGearIndex, setPvpGearIndex] = useState(1);
+  const speedRef = useRef<number>(SPEED_PRESETS[1].value);
   const HILLSHADE_SOURCE_ID = "terrain-hillshade";
   const LAND_FILL_COLOR = "#2f3b2f";
 
@@ -226,6 +246,23 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   );
   const setTankInput = tankParty.setInput;
   const tankPartyStatus = tankParty.status;
+
+  const publishTankInput = useCallback((input: Partial<TankInput>) => {
+    const nextInput: TankInput = {
+      ...tankInputRef.current,
+      ...input,
+      gear: (pvpGearIndexRef.current + 1) as TankGear,
+    };
+    tankInputRef.current = nextInput;
+    setTankInput(nextInput);
+  }, [setTankInput]);
+
+  const changePvpGear = useCallback((index: number) => {
+    const nextIndex = Math.max(0, Math.min(PVP_GEAR_PRESETS.length - 1, index));
+    pvpGearIndexRef.current = nextIndex;
+    setPvpGearIndex(nextIndex);
+    publishTankInput(tankInputRef.current);
+  }, [publishTankInput]);
 
   const startEngineAudio = useCallback(() => {
     const existing = engineAudioRef.current;
@@ -387,8 +424,8 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     }
   }, [playTankShotAudio, tankParty.localPeerId, tankParty.players]);
 
-  const handleTankTouchInput = useCallback((input: TankInput) => {
-    setTankInput(input);
+  const handleTankTouchInput = useCallback((input: Omit<TankInput, "aimHeading">) => {
+    publishTankInput(input);
     if (input.forward !== 0 || input.turn !== 0 || input.firing) {
       startEngineAudio();
     }
@@ -396,7 +433,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
       Math.max(Math.abs(input.forward), Math.abs(input.turn) * 0.45),
       input.forward !== 0 || input.turn !== 0
     );
-  }, [setTankInput, startEngineAudio, updateEngineAudio]);
+  }, [publishTankInput, startEngineAudio, updateEngineAudio]);
 
   const handleRoamTouchInput = useCallback((input: RoamInput) => {
     roamTouchInputRef.current = input;
@@ -555,6 +592,8 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   }, [activeProvider, commitUnitSelection, mapRef, playRtsEffect]);
 
   const openModeMenu = useCallback(() => {
+    setIsRoamMenuOpen(false);
+    setIsPvpMenuOpen(false);
     setIsSelectingPvpSpawn(false);
     setPvpSpawnPreview(null);
     setIsModeMenuOpen(true);
@@ -565,6 +604,8 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
 
   const startGameMode = useCallback((mode: GameMode) => {
     setGameMode(mode);
+    setIsRoamMenuOpen(false);
+    setIsPvpMenuOpen(false);
     setIsModeMenuOpen(false);
     if (mode === "command" && rtsUnitsRef.current.length === 0) {
       const origin = providerCoordRef.current ??
@@ -736,9 +777,9 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
 
         frame.map.jumpTo({
           center,
-          zoom: FOLLOW_ZOOM,
+          zoom: FOLLOW_ZOOM - 1,
           bearing: nextBearing,
-          pitch: 78,
+          pitch: 60,
         });
         return;
       }
@@ -887,6 +928,22 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     setIsSelectingPvpSpawn(false);
   };
 
+  const handlePvpAim = (event: Pick<MapLayerMouseEvent, "lngLat">) => {
+    if (
+      gameMode !== "pvp" ||
+      isModeMenuOpen ||
+      isPvpMenuOpen ||
+      (tankPartyStatus !== "hosting" && tankPartyStatus !== "joined")
+    ) return;
+    const localPlayer = tankParty.playersRef.current.find(
+      (player) => player.id === tankParty.localPeerId
+    );
+    if (!localPlayer || localPlayer.hp <= 0) return;
+    publishTankInput({
+      aimHeading: bearingRadians(localPlayer.position, [event.lngLat.lng, event.lngLat.lat]),
+    });
+  };
+
   const playCheckpointRoute = async () => {
     if (!activeProvider || checkpoints.length === 0 || isRouteLoading) return;
 
@@ -998,11 +1055,32 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     map.triggerRepaint();
   };
 
+  const handleRtsTapCommand = (event: MapLayerMouseEvent) => {
+    if (
+      !isCoarsePointer ||
+      gameMode !== "command" ||
+      isModeMenuOpen ||
+      matchResult ||
+      selectedUnitIdsRef.current.size === 0
+    ) return;
+
+    const units = issueMoveCommand(
+      rtsUnitsRef.current,
+      selectedUnitIdsRef.current,
+      [event.lngLat.lng, event.lngLat.lat]
+    );
+    rtsUnitsRef.current = units;
+    setRtsSnapshot([...units]);
+    playRtsEffect("move");
+    mapRef?.getMap()?.triggerRepaint();
+  };
+
   const handleMapMouseDown = (event: MapLayerMouseEvent) => {
     if (gameMode !== "command" || isModeMenuOpen) {
       if (rotateRef.current) cancelAnimationFrame(rotateRef.current);
       return;
     }
+    if (isCoarsePointer) return;
     if (event.originalEvent.button === 1) {
       event.originalEvent.preventDefault();
       middlePanRef.current = { x: event.point.x, y: event.point.y };
@@ -1020,6 +1098,10 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     if (!map) return;
     if (gameMode === "pvp" && isSelectingPvpSpawn) {
       setPvpSpawnPreview([event.lngLat.lng, event.lngLat.lat]);
+      return;
+    }
+    if (gameMode === "pvp") {
+      if (!isCoarsePointer) handlePvpAim(event);
       return;
     }
     if (gameMode !== "command" || isModeMenuOpen) return;
@@ -1170,20 +1252,60 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
   }, [speedIndex]);
 
   useEffect(() => {
-    roamSimulationActiveRef.current = gameMode === "roam" && !isModeMenuOpen;
+    roamSimulationActiveRef.current = gameMode === "roam" && !isModeMenuOpen && !isRoamMenuOpen;
     if (!roamSimulationActiveRef.current) updateEngineAudio(0, false);
     if (gameMode !== "command" || isModeMenuOpen) {
       updateRtsVehicleAudio(0, rtsUnitsRef.current.filter((unit) => unit.alive).length);
     }
-  }, [gameMode, isModeMenuOpen, updateEngineAudio, updateRtsVehicleAudio]);
+  }, [gameMode, isModeMenuOpen, isRoamMenuOpen, updateEngineAudio, updateRtsVehicleAudio]);
 
   useEffect(() => {
     const onEscape = (event: KeyboardEvent) => {
-      if (event.code === "Escape" && !isModeMenuOpen) openModeMenu();
+      if (event.code !== "Escape" || isModeMenuOpen) return;
+      if (isRoamMenuOpen) {
+        setIsRoamMenuOpen(false);
+        return;
+      }
+      if (isPvpMenuOpen) {
+        setIsPvpMenuOpen(false);
+        return;
+      }
+      openModeMenu();
     };
     window.addEventListener("keydown", onEscape);
     return () => window.removeEventListener("keydown", onEscape);
-  }, [isModeMenuOpen, openModeMenu]);
+  }, [isModeMenuOpen, isPvpMenuOpen, isRoamMenuOpen, openModeMenu]);
+
+  useEffect(() => {
+    if (gameMode !== "roam" || isModeMenuOpen || isRoamMenuOpen) return;
+
+    const onRoamShortcutKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target.tagName))
+      ) return;
+      if (event.repeat) return;
+
+      if (event.code === "KeyC") {
+        event.preventDefault();
+        setCameraMode((current) => {
+          const currentIndex = CAMERA_MODES.indexOf(current);
+          return CAMERA_MODES[(currentIndex + 1) % CAMERA_MODES.length];
+        });
+        return;
+      }
+
+      if (event.code !== "ArrowUp" && event.code !== "ArrowDown") return;
+
+      event.preventDefault();
+      const direction = event.code === "ArrowUp" ? 1 : -1;
+      setSpeedIndex((current) => Math.max(0, Math.min(SPEED_PRESETS.length - 1, current + direction)));
+    };
+
+    window.addEventListener("keydown", onRoamShortcutKeyDown);
+    return () => window.removeEventListener("keydown", onRoamShortcutKeyDown);
+  }, [gameMode, isModeMenuOpen, isRoamMenuOpen]);
 
   useEffect(() => {
     if (!providerCoord) return;
@@ -1192,7 +1314,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
 
   useEffect(() => {
     const map = mapRef?.getMap();
-    if (!map || gameMode !== "roam" || isModeMenuOpen) return;
+    if (!map || gameMode !== "roam" || isModeMenuOpen || isRoamMenuOpen) return;
 
     const initialPosition = providerCoordRef.current;
     if (initialPosition) {
@@ -1406,7 +1528,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
         manualAnimationRef.current = null;
       }
     };
-  }, [gameMode, isModeMenuOpen, mapRef, startEngineAudio, updateEngineAudio]);
+  }, [gameMode, isModeMenuOpen, isRoamMenuOpen, mapRef, startEngineAudio, updateEngineAudio]);
 
   useEffect(() => {
     return () => {
@@ -1567,9 +1689,10 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     if (
       gameMode !== "pvp" ||
       isModeMenuOpen ||
+      isPvpMenuOpen ||
       (tankPartyStatus !== "hosting" && tankPartyStatus !== "joined")
     ) {
-      setTankInput({ forward: 0, turn: 0, firing: false });
+      publishTankInput({ forward: 0, turn: 0, firing: false });
       updateEngineAudio(0, false);
       return;
     }
@@ -1577,14 +1700,28 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     const keys = new Set<string>();
     const publishInput = () => {
       const forward = (keys.has("KeyW") ? 1 : 0) - (keys.has("KeyS") ? 1 : 0);
-      setTankInput({
-      forward,
-      turn: (keys.has("KeyA") ? 1 : 0) - (keys.has("KeyD") ? 1 : 0),
-      firing: keys.has("Space"),
+      publishTankInput({
+        forward,
+        turn: (keys.has("KeyA") ? 1 : 0) - (keys.has("KeyD") ? 1 : 0),
+        firing: keys.has("Space"),
       });
       updateEngineAudio(Math.abs(forward), keys.size > 0);
     };
     const onKeyDown = (event: KeyboardEvent) => {
+      const target = event.target;
+      if (
+        target instanceof HTMLElement &&
+        (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT", "BUTTON"].includes(target.tagName))
+      ) return;
+
+      if (event.code === "ArrowUp" || event.code === "ArrowDown") {
+        event.preventDefault();
+        if (!event.repeat) {
+          changePvpGear(pvpGearIndexRef.current + (event.code === "ArrowUp" ? 1 : -1));
+        }
+        return;
+      }
+
       if (!["KeyW", "KeyA", "KeyS", "KeyD", "Space"].includes(event.code)) return;
       event.preventDefault();
       startEngineAudio();
@@ -1607,10 +1744,10 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
       window.removeEventListener("keydown", onKeyDown);
       window.removeEventListener("keyup", onKeyUp);
       window.removeEventListener("blur", onBlur);
-      setTankInput({ forward: 0, turn: 0, firing: false });
+      publishTankInput({ forward: 0, turn: 0, firing: false });
       updateEngineAudio(0, false);
     };
-  }, [gameMode, isModeMenuOpen, setTankInput, startEngineAudio, tankPartyStatus, updateEngineAudio]);
+  }, [changePvpGear, gameMode, isModeMenuOpen, isPvpMenuOpen, publishTankInput, startEngineAudio, tankPartyStatus, updateEngineAudio]);
 
   const startRouteZip = (path: [number, number][]) => {
     if (zipAnimationRef.current) {
@@ -1883,169 +2020,142 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
     <div>
 
       <div className="w-full h-[100vh] overflow-hidden relative">
-        {gameMode === "roam" && !isModeMenuOpen && (
-        <aside className={`absolute left-3 top-3 z-10 select-none text-xs text-slate-100 sm:left-5 sm:top-5 ${isRoamHudCollapsed ? "w-auto" : "w-[min(19rem,calc(100vw-1.5rem))]"}`}>
-          <div className="relative overflow-hidden border border-cyan-300/35 bg-slate-950/90 shadow-[0_0_0_1px_rgba(15,23,42,0.9),0_18px_50px_rgba(0,0,0,0.55),0_0_24px_rgba(34,211,238,0.08)] backdrop-blur-md [clip-path:polygon(0_0,calc(100%-14px)_0,100%_14px,100%_100%,14px_100%,0_calc(100%-14px))]">
-            <div className="pointer-events-none absolute inset-x-0 top-0 h-px bg-linear-to-r from-transparent via-cyan-300 to-transparent" />
+        {gameMode === "roam" && !isModeMenuOpen && !isRoamMenuOpen && (
+          <button
+            type="button"
+            aria-haspopup="dialog"
+            onClick={() => setIsRoamMenuOpen(true)}
+            className="absolute left-3 top-3 z-40 border border-cyan-300/55 bg-slate-950/88 px-4 py-3 font-mono text-[10px] font-black uppercase tracking-[0.2em] text-cyan-100 shadow-[0_12px_32px_rgba(0,0,0,0.5),0_0_18px_rgba(34,211,238,0.12)] backdrop-blur-md transition hover:border-cyan-200 hover:bg-cyan-300/15 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-cyan-200 sm:left-5 sm:top-5"
+          >
+            ☰ Menu
+          </button>
+        )}
 
-            <header className="flex items-center justify-between border-b border-cyan-300/20 bg-cyan-300/5 px-4 py-3">
-              <div>
-                <p className="text-[9px] font-semibold uppercase tracking-[0.28em] text-cyan-300/70">
-                  Bohol Trips
-                </p>
-                <h2 className="mt-0.5 text-sm font-black uppercase tracking-[0.16em] text-white">
-                  Travel Control
-                </h2>
-              </div>
-              <div className="flex items-center gap-2">
-                <div className="flex items-center gap-1.5 font-mono text-[9px] uppercase tracking-widest text-emerald-300">
-                  <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-emerald-300 shadow-[0_0_8px_rgba(110,231,183,0.9)] motion-reduce:animate-none" />
-                  Online
+        {gameMode === "roam" && !isModeMenuOpen && isRoamMenuOpen && (
+          <aside
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="roam-menu-title"
+            className="absolute inset-0 z-50 overflow-y-auto bg-[#03070d]/95 text-xs text-slate-100 backdrop-blur-md"
+          >
+            <div className="pointer-events-none fixed inset-0 opacity-20 [background-image:linear-gradient(rgba(34,211,238,0.12)_1px,transparent_1px),linear-gradient(90deg,rgba(34,211,238,0.12)_1px,transparent_1px)] [background-size:42px_42px]" />
+            <div className="relative mx-auto flex min-h-full w-full max-w-5xl flex-col px-4 py-5 sm:px-8 sm:py-8">
+              <header className="flex items-center justify-between gap-4 border-b border-cyan-300/25 pb-4">
+                <div>
+                  <p className="text-[9px] font-semibold uppercase tracking-[0.28em] text-cyan-300/70">Bohol Trips</p>
+                  <h2 id="roam-menu-title" className="mt-1 text-2xl font-black uppercase tracking-[0.14em] text-white sm:text-4xl">
+                    Travel Control
+                  </h2>
                 </div>
                 <button
                   type="button"
-                  aria-expanded={!isRoamHudCollapsed}
-                  aria-label={isRoamHudCollapsed ? "Expand travel HUD" : "Collapse travel HUD"}
-                  onClick={() => setIsRoamHudCollapsed((collapsed) => !collapsed)}
-                  className="border border-cyan-300/45 px-2 py-1 font-mono text-[8px] uppercase text-cyan-200 hover:bg-cyan-300/10"
+                  onClick={() => setIsRoamMenuOpen(false)}
+                  className="border border-cyan-300/55 px-4 py-3 font-mono text-[10px] font-black uppercase tracking-[0.18em] text-cyan-100 transition hover:bg-cyan-300/15 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-white"
                 >
-                  {isRoamHudCollapsed ? "Show ▾" : "Hide ▴"}
+                  Close ×
                 </button>
+              </header>
+
+              <div className="grid flex-1 content-center gap-4 py-6 md:grid-cols-2">
+                <section className="border border-slate-700/80 bg-slate-950/80 p-5 shadow-[0_18px_50px_rgba(0,0,0,0.35)] sm:p-6">
+                  <div className="mb-2.5 flex items-center justify-between">
+                    <div>
+                      <p className="text-[9px] font-bold uppercase tracking-[0.22em] text-slate-500">Optics</p>
+                      <p className="mt-0.5 font-bold uppercase tracking-wider text-slate-200">Camera mode</p>
+                    </div>
+                    <span className="font-mono text-[10px] uppercase text-cyan-300">[{cameraMode}]</span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-1">
+                    {CAMERA_MODES.map((mode) => (
+                      <button
+                        key={mode}
+                        type="button"
+                        onClick={() => setCameraMode(mode)}
+                        className={`border px-2 py-2 text-[9px] font-bold uppercase tracking-wider transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300 ${
+                          mode === cameraMode
+                            ? "border-cyan-300 bg-cyan-300/20 text-cyan-100 shadow-[inset_0_-2px_0_rgba(103,232,249,0.8)]"
+                            : "border-slate-700 bg-slate-900/70 text-slate-500 hover:border-cyan-300/40 hover:text-cyan-200"
+                        }`}
+                      >
+                        {mode}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="mt-3 flex items-center justify-between border border-slate-700 bg-black/25 px-2.5 py-2">
+                    <div>
+                      <p className="text-[9px] font-bold uppercase tracking-[0.18em] text-emerald-300">Free roam</p>
+                      <p className="mt-0.5 text-[9px] text-slate-500">Drive ramps for airtime</p>
+                    </div>
+                    <div className="flex items-center gap-1 font-mono text-[9px] font-black text-slate-200">
+                      <kbd className="border border-slate-600 bg-slate-800 px-1.5 py-1">WASD</kbd>
+                      <kbd className="border border-cyan-300/30 bg-cyan-300/10 px-1.5 py-1 text-cyan-200">C CAMERA</kbd>
+                      <span className="border border-amber-300/30 bg-amber-300/10 px-1.5 py-1 text-amber-200">AUTO AIR</span>
+                    </div>
+                  </div>
+                </section>
+
+                <section className="border border-slate-700/80 bg-slate-950/80 p-5 shadow-[0_18px_50px_rgba(0,0,0,0.35)] sm:p-6">
+                  <div className="flex items-center justify-between gap-3">
+                    <div>
+                      <p className="text-[9px] font-bold uppercase tracking-[0.22em] text-slate-500">Mission path</p>
+                      <p className="mt-0.5 font-bold uppercase tracking-wider text-slate-200">Checkpoints</p>
+                    </div>
+                    <span className="font-mono text-2xl font-black leading-none text-cyan-300 tabular-nums">
+                      {String(checkpoints.length).padStart(2, "0")}
+                    </span>
+                  </div>
+                  <p className="mt-2 border-l-2 border-cyan-300/40 pl-2 text-[10px] leading-relaxed text-slate-400">
+                    Select map positions in travel order, then deploy route.
+                  </p>
+                  <div className="mt-3 grid grid-cols-[1fr_auto] gap-2">
+                    <button
+                      type="button"
+                      disabled={checkpoints.length === 0 || isRouteLoading}
+                      onClick={playCheckpointRoute}
+                      className="border border-emerald-300 bg-emerald-300 px-4 py-2.5 text-[10px] font-black uppercase tracking-[0.18em] text-slate-950 shadow-[0_0_16px_rgba(110,231,183,0.2)] transition hover:bg-emerald-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:cursor-not-allowed disabled:border-slate-700 disabled:bg-slate-800 disabled:text-slate-600 disabled:shadow-none"
+                    >
+                      {isRouteLoading ? "Calculating..." : "▶ Deploy"}
+                    </button>
+                    <button
+                      type="button"
+                      aria-label="Clear route"
+                      title="Clear route"
+                      disabled={checkpoints.length === 0 && !rtsRouteGeoJSON}
+                      onClick={clearCheckpoints}
+                      className="border border-red-300/40 bg-red-400/10 px-3 py-2.5 font-mono text-[10px] font-bold uppercase text-red-200 transition hover:border-red-300 hover:bg-red-400/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-300 disabled:cursor-not-allowed disabled:border-slate-800 disabled:bg-transparent disabled:text-slate-700"
+                    >
+                      Reset
+                    </button>
+                  </div>
+                  {routeError && (
+                    <p role="alert" className="mt-2 border border-red-400/30 bg-red-500/10 px-2 py-1.5 font-mono text-[10px] text-red-200">
+                      ERR: {routeError}
+                    </p>
+                  )}
+                </section>
+              </div>
+
+              <footer className="flex flex-col items-stretch justify-between gap-3 border-t border-cyan-300/20 pt-4 sm:flex-row sm:items-center">
+                <div className="font-mono text-[9px] uppercase tracking-[0.18em] text-slate-500">
+                  <span className="text-emerald-300">● Systems online</span>
+                  <span className="ml-3">Esc closes menu</span>
+                </div>
                 <button
                   type="button"
                   onClick={openModeMenu}
-                  className="border border-slate-600 px-2 py-1 font-mono text-[8px] uppercase text-slate-400 hover:border-cyan-300 hover:text-cyan-200"
+                  className="border border-slate-600 px-5 py-3 font-mono text-[10px] font-bold uppercase tracking-[0.18em] text-slate-300 transition hover:border-cyan-300 hover:text-cyan-100 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-cyan-200"
                 >
-                  Modes
+                  Change game mode
                 </button>
-              </div>
-            </header>
-
-            <div className={isRoamHudCollapsed ? "hidden" : "block"}>
-
-            <section className="px-4 py-3">
-              <div className="mb-2.5 flex items-end justify-between">
-                <div>
-                  <p className="text-[9px] font-bold uppercase tracking-[0.22em] text-slate-500">Movement</p>
-                  <p className="mt-0.5 font-bold uppercase tracking-wider text-slate-200">Travel speed</p>
-                </div>
-                <span className="border border-amber-300/30 bg-amber-300/10 px-2 py-1 font-mono text-[10px] font-bold uppercase text-amber-200">
-                  {SPEED_PRESETS[speedIndex]?.label ?? "Fast"}
-                </span>
-              </div>
-              <input
-                aria-label="Travel speed"
-                className="h-1.5 w-full cursor-pointer appearance-none rounded-none bg-slate-700 accent-amber-300 focus-visible:outline-2 focus-visible:outline-offset-4 focus-visible:outline-cyan-300"
-                type="range"
-                min={0}
-                max={SPEED_PRESETS.length - 1}
-                step={1}
-                value={speedIndex}
-                onChange={(e) => setSpeedIndex(Number(e.target.value))}
-              />
-              <div className="mt-3 grid grid-cols-3 gap-1">
-                {SPEED_PRESETS.map((preset, idx) => (
-                  <button
-                    key={preset.label}
-                    type="button"
-                    onClick={() => setSpeedIndex(idx)}
-                    className={`border px-2 py-1.5 text-[9px] font-bold uppercase tracking-wider transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300 ${
-                      idx === speedIndex
-                        ? "border-amber-300 bg-amber-300 text-slate-950 shadow-[0_0_12px_rgba(252,211,77,0.25)]"
-                        : "border-slate-700 bg-slate-900/70 text-slate-400 hover:border-amber-300/50 hover:text-amber-200"
-                    }`}
-                  >
-                    {preset.label}
-                  </button>
-                ))}
-              </div>
-            </section>
-
-            <section className="border-t border-slate-700/70 px-4 py-3">
-              <div className="mb-2.5 flex items-center justify-between">
-                <div>
-                  <p className="text-[9px] font-bold uppercase tracking-[0.22em] text-slate-500">Optics</p>
-                  <p className="mt-0.5 font-bold uppercase tracking-wider text-slate-200">Camera mode</p>
-                </div>
-                <span className="font-mono text-[10px] uppercase text-cyan-300">[{cameraMode}]</span>
-              </div>
-              <div className="grid grid-cols-3 gap-1">
-                {(["follow", "orbit", "free"] as const).map((mode) => (
-                  <button
-                    key={mode}
-                    type="button"
-                    onClick={() => setCameraMode(mode)}
-                    className={`border px-2 py-2 text-[9px] font-bold uppercase tracking-wider transition-colors focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-cyan-300 ${
-                      mode === cameraMode
-                        ? "border-cyan-300 bg-cyan-300/20 text-cyan-100 shadow-[inset_0_-2px_0_rgba(103,232,249,0.8)]"
-                        : "border-slate-700 bg-slate-900/70 text-slate-500 hover:border-cyan-300/40 hover:text-cyan-200"
-                    }`}
-                  >
-                    {mode}
-                  </button>
-                ))}
-              </div>
-              <div className="mt-3 flex items-center justify-between border border-slate-700 bg-black/25 px-2.5 py-2">
-                <div>
-                  <p className="text-[9px] font-bold uppercase tracking-[0.18em] text-emerald-300">Free roam</p>
-                  <p className="mt-0.5 text-[9px] text-slate-500">Drive ramps for airtime</p>
-                </div>
-                <div className="flex items-center gap-1 font-mono text-[9px] font-black text-slate-200">
-                  <kbd className="border border-slate-600 bg-slate-800 px-1.5 py-1">WASD</kbd>
-                  <span className="border border-amber-300/30 bg-amber-300/10 px-1.5 py-1 text-amber-200">AUTO AIR</span>
-                </div>
-              </div>
-            </section>
-
-            <section className="border-t border-slate-700/70 px-4 py-3">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-[9px] font-bold uppercase tracking-[0.22em] text-slate-500">Mission path</p>
-                  <p className="mt-0.5 font-bold uppercase tracking-wider text-slate-200">Checkpoints</p>
-                </div>
-                <span className="font-mono text-2xl font-black leading-none text-cyan-300 tabular-nums">
-                  {String(checkpoints.length).padStart(2, "0")}
-                </span>
-              </div>
-              <p className="mt-2 border-l-2 border-cyan-300/40 pl-2 text-[10px] leading-relaxed text-slate-400">
-                Select map positions in travel order, then deploy route.
-              </p>
-              <div className="mt-3 grid grid-cols-[1fr_auto] gap-2">
-                <button
-                  type="button"
-                  disabled={checkpoints.length === 0 || isRouteLoading}
-                  onClick={playCheckpointRoute}
-                  className="border border-emerald-300 bg-emerald-300 px-4 py-2.5 text-[10px] font-black uppercase tracking-[0.18em] text-slate-950 shadow-[0_0_16px_rgba(110,231,183,0.2)] transition hover:bg-emerald-200 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-white disabled:cursor-not-allowed disabled:border-slate-700 disabled:bg-slate-800 disabled:text-slate-600 disabled:shadow-none"
-                >
-                  {isRouteLoading ? "Calculating..." : "▶ Deploy"}
-                </button>
-                <button
-                  type="button"
-                  aria-label="Clear route"
-                  title="Clear route"
-                  disabled={checkpoints.length === 0 && !rtsRouteGeoJSON}
-                  onClick={clearCheckpoints}
-                  className="border border-red-300/40 bg-red-400/10 px-3 py-2.5 font-mono text-[10px] font-bold uppercase text-red-200 transition hover:border-red-300 hover:bg-red-400/20 focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-300 disabled:cursor-not-allowed disabled:border-slate-800 disabled:bg-transparent disabled:text-slate-700"
-                >
-                  Reset
-                </button>
-              </div>
-              {routeError && (
-                <p role="alert" className="mt-2 border border-red-400/30 bg-red-500/10 px-2 py-1.5 font-mono text-[10px] text-red-200">
-                  ERR: {routeError}
-                </p>
-              )}
-            </section>
-
-            <footer className="flex items-center justify-between border-t border-cyan-300/15 bg-black/30 px-4 py-2 font-mono text-[8px] uppercase tracking-[0.18em] text-slate-600">
-              <span>Nav System 01</span>
-              <span>{checkpoints.length ? "Route armed" : "Awaiting target"}</span>
-            </footer>
+              </footer>
             </div>
-          </div>
-        </aside>
+          </aside>
         )}
-        {gameMode === "roam" && !isModeMenuOpen && (
+
+        {gameMode === "roam" && !isModeMenuOpen && !isRoamMenuOpen && (
+          <GearShift gears={SPEED_PRESETS} activeIndex={speedIndex} onChange={setSpeedIndex} />
+        )}
+        {gameMode === "roam" && !isModeMenuOpen && !isRoamMenuOpen && (
           <MobileRoamControls onInputChange={handleRoamTouchInput} />
         )}
         {gameMode === "command" && !isModeMenuOpen && (
@@ -2057,6 +2167,15 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
             onRematch={resetSkirmish}
           />
         )}
+        {gameMode === "pvp" && !isModeMenuOpen && !isPvpMenuOpen &&
+          (tankPartyStatus === "hosting" || tankPartyStatus === "joined") && (
+            <GearShift
+              gears={PVP_GEAR_PRESETS}
+              activeIndex={pvpGearIndex}
+              onChange={changePvpGear}
+              position="right-raised"
+            />
+          )}
         {gameMode === "pvp" && !isModeMenuOpen && (
           <TankPvpHud
             status={tankParty.status}
@@ -2067,6 +2186,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
             isHost={tankParty.isHost}
             spawnAreaSelected={pvpSpawnCenter !== null}
             isSelectingSpawnArea={isSelectingPvpSpawn}
+            isMenuOpen={isPvpMenuOpen}
             onHost={(name) => {
               if (pvpSpawnCenter) void tankParty.createParty(name);
             }}
@@ -2078,6 +2198,8 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
               openModeMenu();
             }}
             onChangeMode={openModeMenu}
+            onOpenMenu={() => setIsPvpMenuOpen(true)}
+            onCloseMenu={() => setIsPvpMenuOpen(false)}
             onInputChange={handleTankTouchInput}
           />
         )}
@@ -2097,6 +2219,7 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
           onLoad={() => setMapIsReady(true)}
           onMouseDown={handleMapMouseDown}
           onMouseMove={handleMapMouseMove}
+          onTouchMove={handlePvpAim}
           onMouseUp={handleMapMouseUp}
           onContextMenu={handleRtsContextMenu}
           onDragStart={() => { userInteractedRef.current = true; }}
@@ -2106,20 +2229,27 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
             ? handlePvpSpawnClick
             : gameMode === "roam" && !isModeMenuOpen
               ? handleMapClick
-              : undefined}
+              : gameMode === "command" && !isModeMenuOpen
+                ? handleRtsTapCommand
+                : gameMode === "pvp" && !isModeMenuOpen
+                  ? handlePvpAim
+                : undefined}
           initialViewState={initialView}
           maxBounds={boholBounds ?? undefined}
           minZoom={13}
           maxZoom={20}
           maxPitch={85}
-          dragPan={gameMode === "roam" || isSelectingPvpSpawn}
+          dragPan={gameMode === "roam" || isSelectingPvpSpawn || (gameMode === "command" && isCoarsePointer)}
           renderWorldCopies={false}
           mapStyle={mapStyle as any}
           mapLib={import("maplibre-gl")}
           style={{
             width: "100%",
             height: "100%",
-            cursor: isSelectingPvpSpawn ? "crosshair" : undefined,
+            cursor: isSelectingPvpSpawn ||
+              (gameMode === "pvp" && (tankPartyStatus === "hosting" || tankPartyStatus === "joined"))
+              ? "crosshair"
+              : undefined,
           }}
         >
           <NavigationControl position="bottom-right" />
@@ -2320,18 +2450,23 @@ const ProviderMap = ({ coordinates }: { coordinates: string[] }) => {
                   anchor="center"
                 >
                   <div
-                    role={unit.team === "player" ? "button" : undefined}
-                    tabIndex={unit.team === "player" ? 0 : undefined}
+                    role="button"
+                    tabIndex={0}
                     aria-label={`${unit.team} unit ${unit.id}, ${unit.hp} health`}
                     onMouseDown={(event) => event.stopPropagation()}
                     onClick={(event) => {
                       event.stopPropagation();
-                      if (unit.team === "player") selectRtsUnit(unit.id, event.shiftKey);
+                      if (unit.team === "player") {
+                        selectRtsUnit(unit.id, event.shiftKey || isCoarsePointer);
+                      } else if (isCoarsePointer) {
+                        commandEnemyTarget(unit.id);
+                      }
                     }}
                     onKeyDown={(event) => {
-                      if (unit.team === "player" && (event.key === "Enter" || event.key === " ")) {
+                      if (event.key === "Enter" || event.key === " ") {
                         event.preventDefault();
-                        selectRtsUnit(unit.id, event.shiftKey);
+                        if (unit.team === "player") selectRtsUnit(unit.id, event.shiftKey);
+                        else commandEnemyTarget(unit.id);
                       }
                     }}
                     onContextMenu={(event) => {

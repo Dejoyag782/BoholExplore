@@ -3,8 +3,12 @@ import maplibregl from "maplibre-gl";
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import {
+  getTankShotEnd,
+  normalizeAngle,
   TANK_MAX_HP,
   TANK_MAX_AIR_HEIGHT_METERS,
+  TANK_PROJECTILE_MIN_FLIGHT_SECONDS,
+  TANK_PROJECTILE_SPEED_METERS_PER_SECOND,
   TANK_SPEED_METERS,
   type TankPlayer,
 } from "../../../game/tankPvp";
@@ -40,6 +44,7 @@ type TankHealthMarker = {
 type DisplayTank = {
   position: [number, number];
   heading: number;
+  turretHeading: number;
 };
 
 type TankFlightState = {
@@ -62,10 +67,13 @@ const PROJECTILE_BARREL_ANGLE = THREE.MathUtils.degToRad(18);
 const PROJECTILE_MIN_ANGLE = THREE.MathUtils.degToRad(4);
 const PROJECTILE_MAX_ANGLE = THREE.MathUtils.degToRad(50);
 const PROJECTILE_MIN_ARC_METERS = 6;
-const PROJECTILE_SPEED_METERS_PER_SECOND = 260;
 const PROJECTILE_RADIUS = 0.16;
 const PROJECTILE_MUZZLE_ELEVATION_METERS = 12;
-const PROJECTILE_TARGET_ELEVATION_METERS = 8;
+const PROJECTILE_TARGET_ELEVATION_METERS = 0.08;
+const PROJECTILE_GUIDE_SEGMENTS = 32;
+const PROJECTILE_CROSSHAIR_RADIUS_METERS = 5;
+const PROJECTILE_CROSSHAIR_SEGMENTS = 24;
+const MAX_PROJECTILE_POOL_SIZE = 16;
 const TANK_CAMERA_ZOOM = 18.4;
 const TANK_CAMERA_PITCH = 58;
 const TANK_CAMERA_LOOK_AHEAD_METERS = 18;
@@ -96,6 +104,27 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
   private flightStates = new Map<string, TankFlightState>();
   private tankTemplate: THREE.Group | null = null;
   private shots = new Map<string, ActiveShot>();
+  private projectilePool: THREE.Mesh[] = [];
+  private projectileGeometry = new THREE.SphereGeometry(PROJECTILE_RADIUS, 12, 8);
+  private projectileMaterial = new THREE.MeshBasicMaterial({ color: 0xfff1a8 });
+  private projectileGuideMaterial = new THREE.LineBasicMaterial({
+    color: 0xfbbf24,
+    depthTest: false,
+    depthWrite: false,
+    opacity: 1,
+    transparent: false,
+  });
+  private projectileCrosshairMaterial = new THREE.LineBasicMaterial({
+    color: 0xfbbf24,
+    depthTest: false,
+    depthWrite: false,
+    opacity: 1,
+    transparent: false,
+  });
+  private aimGuide: THREE.Group | null = null;
+  private aimGuideOrigin: [number, number] | null = null;
+  private aimGuideElevation = 0;
+  private aimGuideKey = "";
   private lastShotSequence = new Map<string, number>();
   private playersRef: React.MutableRefObject<TankPlayer[]>;
   private localPeerId: string | null;
@@ -180,6 +209,9 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
           object.receiveShadow = true;
         }
       });
+      if (!template.getObjectByName("TurretPivot")) {
+        console.error("Tank PvP model is missing required TurretPivot node; turret will remain fixed");
+      }
       this.tankTemplate = template;
       this.map.triggerRepaint();
     } catch (cause) {
@@ -194,6 +226,7 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
     const group = new THREE.Group();
     group.scale.setScalar(TANK_MODEL_SCALE);
     const tankModel = this.tankTemplate.clone(true);
+    group.userData.turretPivot = tankModel.getObjectByName("TurretPivot") ?? null;
     const ring = new THREE.Mesh(
       new THREE.RingGeometry(2.8, 3.15, 40),
       new THREE.MeshBasicMaterial({ color: player.color, transparent: true, opacity: 0.75, side: THREE.DoubleSide })
@@ -251,13 +284,168 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
     this.healthMarkers.delete(playerId);
     this.displayTanks.delete(playerId);
     this.flightStates.delete(playerId);
+    this.lastShotSequence.delete(playerId);
+    for (const [shotId, shot] of this.shots) {
+      if (!shotId.startsWith(`${playerId}-`)) continue;
+      this.releaseProjectile(shot.mesh);
+      this.shots.delete(shotId);
+    }
+    if (playerId === this.localPeerId) this.clearAimGuide();
+  }
+
+  private acquireProjectile() {
+    const mesh = this.projectilePool.pop() ?? new THREE.Mesh(
+      this.projectileGeometry,
+      this.projectileMaterial
+    );
+    mesh.visible = false;
+    mesh.rotation.set(0, 0, 0);
+    this.scene.add(mesh);
+    return mesh;
+  }
+
+  private releaseProjectile(mesh: THREE.Mesh) {
+    mesh.visible = false;
+    this.scene.remove(mesh);
+    if (this.projectilePool.length < MAX_PROJECTILE_POOL_SIZE) {
+      this.projectilePool.push(mesh);
+    }
+  }
+
+  private createAimGuide(
+    from: [number, number],
+    to: [number, number],
+    fromElevation: number,
+    toElevation: number,
+    arcHeight: number
+  ) {
+    const metersPerDegree = 111_320;
+    const eastMeters = (to[0] - from[0]) * metersPerDegree *
+      Math.cos(THREE.MathUtils.degToRad((from[1] + to[1]) / 2));
+    const northMeters = (to[1] - from[1]) * metersPerDegree;
+    const points = Array.from({ length: PROJECTILE_GUIDE_SEGMENTS + 1 }, (_, index) => {
+      const progress = index / PROJECTILE_GUIDE_SEGMENTS;
+      const elevation = THREE.MathUtils.lerp(fromElevation, toElevation, progress) +
+        4 * arcHeight * progress * (1 - progress);
+      return new THREE.Vector3(
+        eastMeters * progress,
+        elevation - fromElevation,
+        -northMeters * progress
+      );
+    });
+    const guide = new THREE.Group();
+    const curve = new THREE.Line(
+      new THREE.BufferGeometry().setFromPoints(points),
+      this.projectileGuideMaterial
+    );
+    const crosshairPoints: THREE.Vector3[] = [];
+    const endpointY = toElevation - fromElevation + 0.08;
+    for (let index = 0; index < PROJECTILE_CROSSHAIR_SEGMENTS; index += 1) {
+      const angle = (index / PROJECTILE_CROSSHAIR_SEGMENTS) * Math.PI * 2;
+      const nextAngle = ((index + 1) / PROJECTILE_CROSSHAIR_SEGMENTS) * Math.PI * 2;
+      crosshairPoints.push(
+        new THREE.Vector3(
+          eastMeters + Math.cos(angle) * PROJECTILE_CROSSHAIR_RADIUS_METERS,
+          endpointY,
+          -northMeters + Math.sin(angle) * PROJECTILE_CROSSHAIR_RADIUS_METERS
+        ),
+        new THREE.Vector3(
+          eastMeters + Math.cos(nextAngle) * PROJECTILE_CROSSHAIR_RADIUS_METERS,
+          endpointY,
+          -northMeters + Math.sin(nextAngle) * PROJECTILE_CROSSHAIR_RADIUS_METERS
+        )
+      );
+    }
+    crosshairPoints.push(
+      new THREE.Vector3(eastMeters - PROJECTILE_CROSSHAIR_RADIUS_METERS * 1.5, endpointY, -northMeters),
+      new THREE.Vector3(eastMeters + PROJECTILE_CROSSHAIR_RADIUS_METERS * 1.5, endpointY, -northMeters),
+      new THREE.Vector3(eastMeters, endpointY, -northMeters - PROJECTILE_CROSSHAIR_RADIUS_METERS * 1.5),
+      new THREE.Vector3(eastMeters, endpointY, -northMeters + PROJECTILE_CROSSHAIR_RADIUS_METERS * 1.5)
+    );
+    const crosshair = new THREE.LineSegments(
+      new THREE.BufferGeometry().setFromPoints(crosshairPoints),
+      this.projectileCrosshairMaterial
+    );
+    curve.renderOrder = 10;
+    crosshair.renderOrder = 11;
+    guide.add(curve, crosshair);
+    guide.visible = false;
+    this.scene.add(guide);
+    return guide;
+  }
+
+  private clearAimGuide() {
+    if (!this.aimGuide) return;
+    this.aimGuide.traverse((object) => {
+      if (object instanceof THREE.Line) {
+        object.geometry.dispose();
+      }
+    });
+    this.scene.remove(this.aimGuide);
+    this.aimGuide = null;
+    this.aimGuideOrigin = null;
+    this.aimGuideKey = "";
+  }
+
+  private syncAimGuide(player: TankPlayer, candidates: TankPlayer[]) {
+    if (player.hp <= 0) {
+      this.clearAimGuide();
+      return;
+    }
+    const to = getTankShotEnd(player, candidates);
+    const group = this.groups.get(player.id);
+    const terrainPitch = typeof group?.userData.terrainPitch === "number"
+      ? group.userData.terrainPitch
+      : 0;
+    const launchAngle = THREE.MathUtils.clamp(
+      PROJECTILE_BARREL_ANGLE + terrainPitch,
+      PROJECTILE_MIN_ANGLE,
+      PROJECTILE_MAX_ANGLE
+    );
+    const flight = this.flightStates.get(player.id);
+    const fromElevation =
+      (this.map.queryTerrainElevation(player.position) ?? 0) +
+      PROJECTILE_MUZZLE_ELEVATION_METERS +
+      (flight?.airborne ? flight.heightAboveGround : 0);
+    const toElevation = this.map.queryTerrainElevation(to) ?? 0;
+    const distance = distanceMeters(player.position, to);
+    const arcHeight = Math.max(
+      PROJECTILE_MIN_ARC_METERS,
+      (distance * Math.tan(launchAngle)) / 4
+    );
+    const key = [
+      player.position[0].toFixed(6),
+      player.position[1].toFixed(6),
+      to[0].toFixed(6),
+      to[1].toFixed(6),
+      fromElevation.toFixed(1),
+      toElevation.toFixed(1),
+      arcHeight.toFixed(1),
+    ].join(":");
+    if (key === this.aimGuideKey) return;
+
+    this.clearAimGuide();
+    this.aimGuide = this.createAimGuide(
+      player.position,
+      to,
+      fromElevation,
+      toElevation,
+      arcHeight
+    );
+    this.aimGuideOrigin = player.position;
+    this.aimGuideElevation = fromElevation;
+    this.aimGuideKey = key;
   }
 
   private interpolateTank(player: TankPlayer, deltaSeconds: number): DisplayTank {
     const current = this.displayTanks.get(player.id);
     if (!current || distanceMeters(current.position, player.position) > 35) {
       this.flightStates.delete(player.id);
-      const initial = { position: player.position, heading: player.heading };
+      const initial = {
+        position: player.position,
+        heading: player.heading,
+        turretHeading: player.turretHeading,
+      };
       this.displayTanks.set(player.id, initial);
       return initial;
     }
@@ -267,12 +455,14 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
       Math.sin(player.heading - current.heading),
       Math.cos(player.heading - current.heading)
     );
+    const turretDelta = normalizeAngle(player.turretHeading - current.turretHeading);
     const next: DisplayTank = {
       position: [
         current.position[0] + (player.position[0] - current.position[0]) * smoothing,
         current.position[1] + (player.position[1] - current.position[1]) * smoothing,
       ],
       heading: current.heading + headingDelta * smoothing,
+      turretHeading: normalizeAngle(current.turretHeading + turretDelta * smoothing),
     };
     this.displayTanks.set(player.id, next);
     return next;
@@ -335,12 +525,7 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
       const seenSequence = this.lastShotSequence.get(player.id) ?? 0;
       if (!player.lastShot || player.shotSequence <= seenSequence) continue;
       this.lastShotSequence.set(player.id, player.shotSequence);
-      const mesh = new THREE.Mesh(
-        new THREE.SphereGeometry(PROJECTILE_RADIUS, 12, 8),
-        new THREE.MeshBasicMaterial({ color: 0xfff1a8 })
-      );
-      mesh.visible = false;
-      this.scene.add(mesh);
+      const mesh = this.acquireProjectile();
       const distance = distanceMeters(player.lastShot.from, player.lastShot.to);
       const group = this.groups.get(player.id);
       const terrainPitch = typeof group?.userData.terrainPitch === "number"
@@ -356,20 +541,26 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
       const airborneOffset = flight?.airborne
         ? flight.heightAboveGround
         : 0;
+      const fromElevation =
+        launchTerrainElevation + PROJECTILE_MUZZLE_ELEVATION_METERS + airborneOffset;
+      const toElevation =
+        (this.map.queryTerrainElevation(player.lastShot.to) ?? 0) +
+        PROJECTILE_TARGET_ELEVATION_METERS;
+      const arcHeight = Math.max(
+        PROJECTILE_MIN_ARC_METERS,
+        (distance * Math.tan(launchAngle)) / 4
+      );
       this.shots.set(`${player.id}-${player.shotSequence}`, {
         mesh,
         from: player.lastShot.from,
         to: player.lastShot.to,
-        fromElevation:
-          launchTerrainElevation + PROJECTILE_MUZZLE_ELEVATION_METERS + airborneOffset,
-        toElevation:
-          (this.map.queryTerrainElevation(player.lastShot.to) ?? 0) +
-          PROJECTILE_TARGET_ELEVATION_METERS,
-        arcHeight: Math.max(
-          PROJECTILE_MIN_ARC_METERS,
-          (distance * Math.tan(launchAngle)) / 4
+        fromElevation,
+        toElevation,
+        arcHeight,
+        durationMs: Math.max(
+          TANK_PROJECTILE_MIN_FLIGHT_SECONDS * 1_000,
+          (distance / TANK_PROJECTILE_SPEED_METERS_PER_SECOND) * 1_000
         ),
-        durationMs: Math.max(420, (distance / PROJECTILE_SPEED_METERS_PER_SECOND) * 1_000),
         startedAt: now,
       });
     }
@@ -491,9 +682,11 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
     }
     this.groups.forEach((group) => { group.visible = false; });
     this.shots.forEach((shot) => { shot.mesh.visible = false; });
+    if (this.aimGuide) this.aimGuide.visible = false;
     const projection = new THREE.Matrix4().fromArray(Array.from(args.defaultProjectionData.mainMatrix));
     const scale = zoomToScale(this.map.getZoom());
     let localDisplayTank: DisplayTank | null = null;
+    let localDisplayPlayer: TankPlayer | null = null;
     this.renderer.resetState();
     for (const player of players) {
       const displayTank = this.interpolateTank(player, deltaSeconds);
@@ -514,6 +707,12 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
       group.visible = true;
       // The normalized GLB tank points down the layer's local -Z axis.
       this.applyTerrainOrientation(group, displayPlayer, flight);
+      const turretPivot = group.userData.turretPivot;
+      if (turretPivot instanceof THREE.Object3D) {
+        turretPivot.rotation.y = normalizeAngle(
+          displayPlayer.turretHeading - displayPlayer.heading
+        );
+      }
       group.position.y = altitudeAboveGround;
       const modelMatrix = this.map.transform.getMatrixForModel(displayPlayer.position, groundAltitude);
       this.camera.projectionMatrix = projection
@@ -521,7 +720,28 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
         .multiply(new THREE.Matrix4().fromArray(modelMatrix).scale(new THREE.Vector3(scale, scale, scale)));
       renderer.render(this.scene, this.camera);
       group.visible = false;
-      if (player.id === this.localPeerId) localDisplayTank = displayTank;
+      if (player.id === this.localPeerId) {
+        localDisplayTank = displayTank;
+        localDisplayPlayer = displayPlayer;
+      }
+    }
+
+    if (localDisplayPlayer) {
+      this.syncAimGuide(localDisplayPlayer, players);
+      if (this.aimGuide && this.aimGuideOrigin) {
+        this.aimGuide.visible = true;
+        const guideModelMatrix = this.map.transform.getMatrixForModel(
+          this.aimGuideOrigin,
+          this.aimGuideElevation
+        );
+        this.camera.projectionMatrix = projection
+          .clone()
+          .multiply(new THREE.Matrix4().fromArray(guideModelMatrix));
+        renderer.render(this.scene, this.camera);
+        this.aimGuide.visible = false;
+      }
+    } else {
+      this.clearAimGuide();
     }
 
     this.syncShots(players, now);
@@ -529,10 +749,7 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
     this.shots.forEach((shot, id) => {
       const progress = (now - shot.startedAt) / shot.durationMs;
       if (progress >= 1) {
-        this.scene.remove(shot.mesh);
-        shot.mesh.geometry.dispose();
-        const materials = Array.isArray(shot.mesh.material) ? shot.mesh.material : [shot.mesh.material];
-        materials.forEach((material) => material.dispose());
+        this.releaseProjectile(shot.mesh);
         this.shots.delete(id);
         return;
       }
@@ -571,12 +788,14 @@ class TankThreeLayer implements maplibregl.CustomLayerInterface {
       this.shadowReceiver = undefined;
     }
     this.renderer?.dispose();
-    this.shots.forEach((shot) => {
-      shot.mesh.geometry.dispose();
-      const materials = Array.isArray(shot.mesh.material) ? shot.mesh.material : [shot.mesh.material];
-      materials.forEach((material) => material.dispose());
-    });
+    this.shots.forEach((shot) => this.scene.remove(shot.mesh));
     this.shots.clear();
+    this.clearAimGuide();
+    this.projectilePool.length = 0;
+    this.projectileGeometry.dispose();
+    this.projectileMaterial.dispose();
+    this.projectileGuideMaterial.dispose();
+    this.projectileCrosshairMaterial.dispose();
     this.lastShotSequence.clear();
     this.healthMarkers.clear();
     this.displayTanks.clear();

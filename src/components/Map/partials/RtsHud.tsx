@@ -43,11 +43,24 @@ const RtsHud = ({ units, selectedCount, matchResult, onChangeMode, onRematch }: 
           </div>
         </div>
         <div className="space-y-1 px-4 py-3 font-mono text-[9px] uppercase tracking-wider text-slate-400">
-          <p><span className="text-cyan-300">LMB</span> select · drag box · Shift add</p>
-          <p><span className="text-rose-300">RMB</span> move formation / attack target</p>
-          <p><span className="text-amber-300">MMB</span> pan · wheel zoom · Q/E rotate</p>
+          <div className="md:hidden">
+            <p><span className="text-cyan-300">Tap blue</span> select units</p>
+            <p><span className="text-emerald-300">Tap terrain</span> send selected</p>
+            <p><span className="text-rose-300">Tap red</span> attack · drag map to pan</p>
+          </div>
+          <div className="hidden space-y-1 md:block">
+            <p><span className="text-cyan-300">LMB</span> select · drag box · Shift add</p>
+            <p><span className="text-rose-300">RMB</span> move formation / attack target</p>
+            <p><span className="text-amber-300">MMB</span> pan · wheel zoom · Q/E rotate</p>
+          </div>
         </div>
       </aside>
+
+      {!matchResult && (
+        <div className="pointer-events-none absolute bottom-4 left-1/2 z-30 -translate-x-1/2 border border-cyan-300/35 bg-slate-950/85 px-4 py-2 text-center font-mono text-[9px] font-bold uppercase tracking-[0.14em] text-cyan-100 shadow-xl backdrop-blur-sm md:hidden">
+          {selectedCount > 0 ? "Tap terrain to send · Tap red to attack" : "Tap a blue unit to command"}
+        </div>
+      )}
 
       {matchResult && (
         <div className="absolute inset-0 z-40 grid place-items-center bg-black/65 px-4 backdrop-blur-sm">

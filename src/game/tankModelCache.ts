@@ -1,6 +1,6 @@
-export const TANK_MODEL_URL = "/models/tank-v1.glb?v=1";
+export const TANK_MODEL_URL = "/models/tank-v1.glb?v=2";
 
-const TANK_MODEL_CACHE = "boholtrips-tank-model-v1";
+const TANK_MODEL_CACHE = "boholtrips-tank-model-v2";
 let cachePromise: Promise<void> | null = null;
 
 const fetchTankModel = async () => {
